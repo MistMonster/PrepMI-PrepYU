@@ -14,6 +14,12 @@ First compiled release of PrepMI-PrepYU, a local GUI tool for preparing image da
 
 ## New In This Build
 
+- Caption Settings now supports `Local server` mode for Ollama, LM Studio, KoboldCPP, OpenAI-compatible local servers, and custom JSON endpoints
+- Caption prompt presets can be loaded, saved, removed, and restored to the built-in default
+- Caption generation runs in a background worker so the GUI stays responsive
+- Cut / Split export runs in a background worker, including final export copying/resizing
+- The default caption template now includes angle, direction, and expression fields
+- Clean distribution build excludes direct Torch/Transformers local-model runtimes; use Local server mode for packaged local captioning
 - First `User` tab for folder-structure preferences
 - Configurable paths for project images, split output, broad set, strict set, rejected images, anchors, and final export
 - Side-by-side Dataset Prep anchor comparison
