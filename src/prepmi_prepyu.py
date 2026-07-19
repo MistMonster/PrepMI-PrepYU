@@ -1608,6 +1608,17 @@ class MainWindow(QMainWindow):
         project_root = root or self.dataset_root or DEFAULT_DATASETS_DIR
         return project_root / self.folder_rel(key)
 
+    def current_prepped_folder(self, root: Path | None = None) -> Path:
+        project_root = root or self.dataset_root or DEFAULT_DATASETS_DIR
+        manifest = self.manifest if project_root == self.dataset_root else Manifest(project_root)
+        configured = self.project_folder("export", project_root)
+        folder = manifest.data.get("export", {}).get("folder", "")
+        if folder:
+            candidate = Path(folder)
+            if candidate.exists():
+                return candidate
+        return configured
+
     def build_user_tab(self) -> QWidget:
         tab = QWidget()
         outer = QVBoxLayout(tab)
@@ -1938,7 +1949,7 @@ class MainWindow(QMainWindow):
         create = QPushButton("Create/Repair")
         rename = QPushButton("Rename Project")
         delete = QPushButton("Delete Project")
-        load = QPushButton("Load Project Images")
+        load = QPushButton("Load Prepped Images")
         source = QPushButton("Load Source Folder")
         browse.clicked.connect(self.choose_dataset_root)
         create.clicked.connect(self.ensure_dataset_structure)
@@ -1954,7 +1965,7 @@ class MainWindow(QMainWindow):
             (create, "Create the expected project folder structure. If blank, you will be asked for a project name."),
             (rename, "Rename the selected project folder and update its manifest."),
             (delete, "Delete the selected project only if it is inside a configured project root. Outside folders are refused for safety."),
-            (load, "Load images from the configured project images folder."),
+            (load, "Load images from the current prepped/final dataset folder."),
             (source, "Load images from any user-selected folder."),
         ]:
             top.addWidget(add_help(button, tip))
@@ -1977,7 +1988,7 @@ class MainWindow(QMainWindow):
         quick.addWidget(add_help(self.caption_mode, "Quick caption mode selection; detailed backend setup lives in Caption Settings."))
         quick.addWidget(QLabel("Trigger token"))
         quick.addWidget(add_help(self.trigger_edit, "Required. Generated captions start with this exact token followed by a comma."), 1)
-        for button, tip in [(caption_settings, "Configure manual, local, API, or custom command captioning."), (generate, "Generate captions for selected strict images."), (validate, "Run image/caption/integrity checks."), (export, "Resize/copy the strict dataset into the configured export folder or a versioned folder.")]:
+        for button, tip in [(caption_settings, "Configure manual, local, API, or custom command captioning."), (generate, "Generate captions for selected prepped images."), (validate, "Run image/caption/integrity checks on the current prepped folder."), (export, "Resize/copy split images into the configured prepped folder or a versioned folder.")]:
             quick.addWidget(add_help(button, tip))
         layout.addLayout(quick)
 
@@ -1985,7 +1996,7 @@ class MainWindow(QMainWindow):
         layout.addWidget(split, 1)
         left = QWidget()
         left_layout = QVBoxLayout(left)
-        self.dataset_list = DropListWidget("Load dataset images or drop source images here.", 96)
+        self.dataset_list = DropListWidget("Load a project to show prepped images here.", 96)
         self.dataset_list.files_dropped.connect(self.handle_dataset_drop)
         self.dataset_list.currentItemChanged.connect(self.dataset_selection_changed)
         self.dataset_list.setSelectionMode(QListWidget.ExtendedSelection)
@@ -2067,7 +2078,7 @@ class MainWindow(QMainWindow):
         self.resize_mode.setCurrentText(self.manifest.data.get("export", {}).get("resize_mode", "Keep aspect ratio"))
         form.addRow("Final image size", add_help(self.export_size, "Final export target; choose Custom to type any WIDTHxHEIGHT."))
         form.addRow("Custom size", add_help(self.custom_export_size, "Used only when Final image size is Custom."))
-        form.addRow("Resize mode", add_help(self.resize_mode, "How strict images are resized during final export."))
+        form.addRow("Resize mode", add_help(self.resize_mode, "How split images are resized when creating the prepped folder."))
         right_layout.addWidget(export_box)
         split.addWidget(right)
         split.setSizes([580, 820])
@@ -2095,7 +2106,7 @@ class MainWindow(QMainWindow):
         self.library_list = QListWidget()
         self.library_list.currentItemChanged.connect(self.library_selection_changed)
         self.library_list.itemDoubleClicked.connect(lambda _: self.open_library_dataset())
-        left_layout.addWidget(add_help(self.library_list, "Known projects. Selecting one shows its manifest and strict-set thumbnails. Double-click to open in Dataset Prep."), 1)
+        left_layout.addWidget(add_help(self.library_list, "Known projects. Selecting one shows its manifest and prepped thumbnails. Double-click to open in Dataset Prep."), 1)
         split.addWidget(left)
 
         detail_split = QSplitter(Qt.Horizontal)
@@ -2104,7 +2115,7 @@ class MainWindow(QMainWindow):
         self.library_summary = QLabel("Select a project to inspect.")
         self.library_summary.setWordWrap(True)
         middle_layout.addWidget(self.library_summary)
-        self.library_thumbs = DropListWidget("Select a project to show strict-set thumbnails.", 128)
+        self.library_thumbs = DropListWidget("Select a project to show prepped thumbnails.", 128)
         self.library_thumbs.setViewMode(QListView.IconMode)
         self.library_thumbs.setMovement(QListView.Static)
         self.library_thumbs.setWrapping(True)
@@ -2113,9 +2124,9 @@ class MainWindow(QMainWindow):
         self.library_thumbs.setGridSize(QSize(138, 138))
         self.library_thumbs.setIconSize(QSize(128, 128))
         self.library_thumbs.currentItemChanged.connect(self.library_thumbnail_changed)
-        middle_layout.addWidget(QLabel("Strict-set thumbnails"))
+        middle_layout.addWidget(QLabel("Prepped thumbnails"))
         middle_layout.addWidget(self.library_thumbs, 1)
-        self.library_preview = ImagePreview("Select a 0.useV2 thumbnail to preview.")
+        self.library_preview = ImagePreview("Select a prepped thumbnail to preview.")
         self.library_preview.setMinimumHeight(260)
         middle_layout.addWidget(self.library_preview, 1)
         detail_split.addWidget(middle)
@@ -2172,7 +2183,7 @@ class MainWindow(QMainWindow):
               td, th {{ border: 1px solid #555; padding: 5px 8px; }}
             </style>
             <h1>PrepMI-PrepYU Guide</h1>
-            <p><b>Short version:</b> this app is for turning messy image folders and sheets into a LoRA-ready project. Pick or import a project, split what needs splitting, sort the useful images, caption the strict set, validate it, export it, then make an Ostris config you can manually load in AI Toolkit.</p>
+            <p><b>Short version:</b> this app is for turning messy image folders and sheets into a LoRA-ready project. Pick or import a project, split what needs splitting, copy the split images into the prepped folder, caption those actual prepped files, validate them, then make an Ostris config you can manually load in AI Toolkit.</p>
 
             {guide_img("dataset_prep.png", "Dataset Prep: project selection, review grid, preview, captions, and export controls.")}
 
@@ -2190,8 +2201,8 @@ dataset\\split\\
 0.Prepped\\
 rejected\\
 manifest.json</pre>
-            <p>You can select a project with <b>Select Project</b>, pick one from <b>Available projects</b>, or just drag a folder onto the Dataset Prep tab. If the dropped folder already lives under the app's <code>datasets\\</code> folder, PrepMI-PrepYU opens it. If it is outside that folder, the app copies it into <code>datasets\\</code>, creates the configured folders, creates/repairs the manifest, and loads your configured project image folder.</p>
-            <p>The important bit: the project image folder is configurable. <b>Dataset Prep</b> is the tab name. Different thing. Past-us made that confusing; current-us is trying to be less rude about it.</p>
+            <p>You can select a project with <b>Select Project</b>, pick one from <b>Available projects</b>, or just drag a folder onto the Dataset Prep tab. If the dropped folder already lives under the app's <code>datasets\\</code> folder, PrepMI-PrepYU opens it. If it is outside that folder, the app copies it into <code>datasets\\</code>, creates the configured folders, creates/repairs the manifest, and loads the current prepped folder.</p>
+            <p>The important bit: the project image folder is for raw/source images. <b>Dataset Prep</b> shows the prepped images that will actually get captions. Different thing. Past-us made that confusing; current-us is trying to be less rude about it.</p>
             <p><b>Deletion safety:</b> the app refuses to delete folders outside the configured project roots. Imported outside folders are copied into the app-managed project area first, and the app only deletes the managed copy. If something lives outside those roots, use <b>Archive/Hide</b> or remove it manually.</p>
 
             <h2>Cut / Split</h2>
@@ -2206,21 +2217,20 @@ manifest.json</pre>
             <p>The Play-style <b>Export</b> button starts cutting. <b>Stop</b> cancels the running export after the current crop/source step. Already exported files stay where they are.</p>
 
             <h2>Dataset Prep</h2>
-            <p>This is the sorting and captioning workbench. Load images from the configured project image folder, or load a source folder if you are borrowing images from somewhere else.</p>
+            <p>This is the prepped-dataset workbench. By default it shows the configured final/prepped folder, usually <code>0.Prepped\\</code>. Those are the images that get captions.</p>
             <p>The usual flow is:</p>
             <ol>
-              <li>Put the broad usable images into the configured broad folder. Default: <code>1.Prep\\0.use</code>.</li>
-              <li>Put the strict training set into the configured strict folder. Default: <code>1.Prep\\0.useV2</code>.</li>
-              <li>Reject junk into the configured rejected folder so it is not silently haunting the project.</li>
-              <li>Add captions for the strict set. Captions must start with <code>&lt;trigger&gt;,</code> exactly.</li>
+              <li>Put raw sheets and source images in the configured source folder. Default: <code>dataset\\</code>.</li>
+              <li>Cut/split source images into the configured split folder. Default: <code>dataset\\split\\</code>.</li>
+              <li>Click <b>Export Final Dataset</b> to resize/copy those split images into the configured prepped folder. Default: <code>0.Prepped</code>.</li>
+              <li>Add captions for the prepped files. Captions must start with <code>&lt;trigger&gt;,</code> exactly.</li>
               <li>Run <b>Validate Everything</b>.</li>
-              <li>Export the final folder into the configured export folder or a versioned export.</li>
             </ol>
             <p><b>Caption Settings</b> controls manual/template captions, local model settings, API model settings, and custom command captions. API modes may send images to the selected provider; manual/template mode does not.</p>
 
             <h2>Library</h2>
-            {guide_img("library.png", "Library: project list, manifest preview, cached 0.useV2 thumbnails, and large preview.")}
-            <p>The Library scans the app-managed <code>datasets\\</code> folder and any custom project roots in Settings. It de-dupes folders, shows project counts, previews the manifest, and shows cached thumbnails from the configured strict folder. The thumbnail cache is shared app-wide in <code>thumbnail_cache\\</code>, so the app is not making a pile of duplicate little images.</p>
+            {guide_img("library.png", "Library: project list, manifest preview, cached prepped thumbnails, and large preview.")}
+            <p>The Library scans the app-managed <code>datasets\\</code> folder and any custom project roots in Settings. It de-dupes folders, shows project counts, previews the manifest, and shows cached thumbnails from the configured prepped folder. The thumbnail cache is shared app-wide in <code>thumbnail_cache\\</code>, so the app is not making a pile of duplicate little images.</p>
 
             <h2>Ostris Configs / AI Toolkit Presets</h2>
             {guide_img("ostris.png", "Ostris config builder: form controls and editable YAML side by side.")}
@@ -2247,14 +2257,11 @@ manifest.json</pre>
             <h2>Suggested Workflow</h2>
             <ol>
               <li>Create or drop/import a project.</li>
-              <li>Put raw images in the configured project image folder.</li>
+              <li>Put raw sheets/source images in the configured project image folder.</li>
               <li>Use Cut / Split if sheets, faces, or manual crops need cleanup.</li>
-              <li>Review images in Dataset Prep.</li>
-              <li>Use <code>0.use</code> for broad maybe-good images.</li>
-              <li>Use <code>0.useV2</code> for the strict run. Be picky here.</li>
-              <li>Caption with a real trigger token. No surprise trigger magic.</li>
+              <li>Export split images into the prepped folder.</li>
+              <li>Review and caption the prepped images in Dataset Prep with a real trigger token. No surprise trigger magic.</li>
               <li>Validate everything.</li>
-              <li>Export final images.</li>
               <li>Build/tweak Ostris YAML and run it manually in AI Toolkit.</li>
             </ol>
             <p>That is the loop. The app is here to keep the boring folder bookkeeping honest while you make the actual taste calls.</p>
@@ -2848,7 +2855,7 @@ manifest.json</pre>
         self.manifest = Manifest(root)
         self.ensure_dataset_structure(save=save_last)
         self.refresh_project_thumbnail_cache(root)
-        self.load_dataset_images(self.project_folder("project_images", root))
+        self.load_current_dataset_images()
         self.update_split_project_label()
         self.refresh_library()
         self.refresh_project_combo()
@@ -3446,7 +3453,7 @@ manifest.json</pre>
         root = self.require_dataset_root()
         if root is None:
             return
-        self.load_dataset_images(self.project_folder("project_images", root))
+        self.load_dataset_images(self.current_prepped_folder(root))
 
     def load_dataset_images_from_paths(self, paths: list[Path]) -> None:
         files = image_paths_from_items(paths)
@@ -3535,10 +3542,10 @@ manifest.json</pre>
         self.manifest.data["trigger"] = trigger
         self.manifest.data["caption_mode"] = self.caption_mode.currentText()
         selected = [Path(item.data(Qt.UserRole)) for item in self.dataset_list.selectedItems() if item.data(Qt.UserRole)]
-        strict_dir = self.project_folder("strict", root)
-        images = selected or image_paths_from_items([strict_dir])
+        prepped_dir = self.current_prepped_folder(root)
+        images = selected or image_paths_from_items([prepped_dir])
         if not images:
-            QMessageBox.information(self, APP_NAME, f"Select images or add images to {self.folder_rel('strict')} first.")
+            QMessageBox.information(self, APP_NAME, f"Select images or export images to {prepped_dir} first.")
             return
         mode = self.caption_mode.currentText()
         settings = self.settings
@@ -3599,10 +3606,10 @@ manifest.json</pre>
         if not trigger:
             QMessageBox.warning(self, APP_NAME, "Enter a trigger token before export.")
             return
-        strict_dir = self.project_folder("strict", root)
-        images = image_paths_from_items([strict_dir])
+        split_dir = self.project_folder("split", root)
+        images = image_paths_from_items([split_dir])
         if not images:
-            QMessageBox.warning(self, APP_NAME, f"No strict images found in {self.folder_rel('strict')}.")
+            QMessageBox.warning(self, APP_NAME, f"No split images found in {self.folder_rel('split')}.")
             return
         size_text = self.export_size_text()
         base = self.project_folder("export", root)
@@ -3618,12 +3625,13 @@ manifest.json</pre>
             if cap:
                 (export_dir / image_path.with_suffix(CAPTION_EXT).name).write_text(self.force_trigger(cap, trigger), encoding="utf-8")
             exported += 1
-            self.update_progress(index, f"Exporting final dataset: {image_path.name}")
+            self.update_progress(index, f"Copying split image to prepped folder: {image_path.name}")
         self.manifest.data["trigger"] = trigger
         self.manifest.data["export"] = {"size": size_text, "resize_mode": self.resize_mode.currentText(), "folder": str(export_dir)}
         self.manifest.data["dataset"]["last_exported"] = timestamp()
-        self.manifest.save(f"exported {exported} image(s) to {export_dir}")
-        self.end_progress(f"Exported {exported} final image(s) to {export_dir}")
+        self.manifest.save(f"copied {exported} split image(s) to {export_dir}")
+        self.load_current_dataset_images()
+        self.end_progress(f"Copied {exported} split image(s) to {export_dir}")
 
     def validate_dataset(self) -> None:
         root = self.require_dataset_root()
@@ -3636,9 +3644,10 @@ manifest.json</pre>
     def dataset_validation_report(self, root: Path) -> list[str]:
         trigger = self.trigger_edit.text().strip() or Manifest(root).data.get("trigger", "")
         strict = self.project_folder("strict", root)
-        export = self.project_folder("export", root)
-        images = image_paths_from_items([strict])
-        caps = list(strict.glob(f"*{CAPTION_EXT}")) if strict.exists() else []
+        split = self.project_folder("split", root)
+        prepped = self.current_prepped_folder(root)
+        images = image_paths_from_items([prepped])
+        caps = list(prepped.glob(f"*{CAPTION_EXT}")) if prepped.exists() else []
         image_stems = {p.stem for p in images}
         cap_stems = {p.stem for p in caps}
         duplicates = sorted({p.name for p in images if sum(1 for q in images if q.name.lower() == p.name.lower()) > 1})
@@ -3648,7 +3657,7 @@ manifest.json</pre>
         if target != "Original":
             try:
                 expected = parse_size(target)
-                for image_path in image_paths_from_items([export]):
+                for image_path in image_paths_from_items([prepped]):
                     with Image.open(image_path) as image:
                         if image.size != expected:
                             wrong_dims.append(f"{image_path.name} {image.size[0]}x{image.size[1]}")
@@ -3657,7 +3666,10 @@ manifest.json</pre>
         return [
             f"Project: {root}",
             f"Trigger: {trigger or 'MISSING'}",
-            f"Strict image count: {len(images)}",
+            f"Split image count: {len(image_paths_from_items([split]))}",
+            f"Strict source count: {len(image_paths_from_items([strict]))}",
+            f"Prepped folder: {prepped}",
+            f"Prepped image count: {len(images)}",
             f"Caption count: {len(caps)}",
             f"Missing captions: {', '.join(sorted(image_stems - cap_stems)) or 'none'}",
             f"Orphan captions: {', '.join(sorted(cap_stems - image_stems)) or 'none'}",
@@ -3754,16 +3766,16 @@ manifest.json</pre>
             f"{root.name} | trigger {trigger} | images {counts['project_images']} | 0.use {counts['broad']} | "
             f"0.useV2 {counts['strict']} | prepped {counts['export']} | export {export.get('size', 'not exported')} | {root}"
         )
-        strict_images = image_paths_from_items([self.project_folder("strict", root)])
-        if not strict_images:
+        prepped_images = image_paths_from_items([self.current_prepped_folder(root)])
+        if not prepped_images:
             self.library_thumbs.show_empty()
             return
-        self.begin_progress("Loading library thumbnails", len(strict_images))
-        for index, path in enumerate(strict_images, start=1):
+        self.begin_progress("Loading library thumbnails", len(prepped_images))
+        for index, path in enumerate(prepped_images, start=1):
             self.library_thumbs.addItem(library_thumb_item(path))
             self.update_progress(index, f"Loading library thumbnail: {path.name}")
         self.library_thumbs.setCurrentRow(0)
-        self.end_progress(f"Loaded {len(strict_images)} library thumbnail(s)")
+        self.end_progress(f"Loaded {len(prepped_images)} library thumbnail(s)")
 
     def library_selection_changed(self, current: QListWidgetItem | None) -> None:
         root = Path(current.data(Qt.UserRole)) if current and current.data(Qt.UserRole) else None
@@ -4621,7 +4633,7 @@ manifest.json</pre>
         if root is None:
             return
         captions = []
-        for cap in self.project_folder("strict", root).glob(f"*{CAPTION_EXT}"):
+        for cap in self.current_prepped_folder(root).glob(f"*{CAPTION_EXT}"):
             text = cap.read_text(encoding="utf-8", errors="replace").strip()
             if text:
                 captions.append(text)
