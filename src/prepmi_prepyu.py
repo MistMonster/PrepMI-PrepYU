@@ -77,7 +77,7 @@ except ImportError as exc:  # pragma: no cover
 
 APP_NAME = "PrepMI-PrepYU"
 APP_SUBTITLE = "Dataset Prep Studio"
-APP_VERSION = "0.1.1"
+APP_VERSION = "0.1.2"
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff"}
 CAPTION_EXT = ".txt"
 THEME = {
@@ -157,6 +157,7 @@ SPLIT_THUMB_SPACING = 5
 SETTINGS_PATH = APP_DIR / "settings.json"
 ICON_PATH = RESOURCE_DIR / "assets" / "prepmi-prepyu.ico"
 GUIDE_ASSET_DIR = APP_DIR / "assets" / "guide"
+HAAR_CASCADE_PATH = RESOURCE_DIR / "assets" / "opencv" / "haarcascade_frontalface_default.xml"
 DEFAULT_FOLDER_PREFERENCES = {
     "anchors": "anchors",
     "project_images": "dataset",
@@ -4081,10 +4082,10 @@ manifest.json</pre>
         if image is None:
             return [], f"Could not read image: {path.name}"
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-        cascade_path = Path(cv2.data.haarcascades) / "haarcascade_frontalface_default.xml"
+        cascade_path = HAAR_CASCADE_PATH if HAAR_CASCADE_PATH.exists() else Path(cv2.data.haarcascades) / "haarcascade_frontalface_default.xml"
         detector = cv2.CascadeClassifier(str(cascade_path))
         if detector.empty():
-            return [], "OpenCV Haar cascade could not be loaded."
+            return [], f"OpenCV Haar cascade could not be loaded: {cascade_path}"
         min_size = self.face_min_size.value()
         detected = detector.detectMultiScale(gray, scaleFactor=1.08, minNeighbors=4, minSize=(min_size, min_size))
         height, width = gray.shape[:2]
