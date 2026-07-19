@@ -1,11 +1,12 @@
-﻿__pycache__/
-*.py[cod]
-build/
-dist/
-*.zip
 settings.json
 datasets/
 models/
 thumbnail_cache/
+build/
+dist/
+__pycache__/
+*.pyc
+*.pyo
+*.zip
 output/
 .tmp_ai_toolkit/

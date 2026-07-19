@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ctypes
+import base64
 import hashlib
 import json
 import os
@@ -8,6 +9,8 @@ import shutil
 import subprocess
 import sys
 import time
+import urllib.error
+import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -25,7 +28,7 @@ except Exception:  # pragma: no cover
     yaml = None
 
 try:
-    from PySide6.QtCore import QEvent, QPoint, QRect, QSize, Qt, Signal
+    from PySide6.QtCore import QObject, QEvent, QPoint, QProcess, QRect, QSize, Qt, QThread, Signal
     from PySide6.QtGui import QColor, QIcon, QPainter, QPen, QPixmap
     from PySide6.QtWidgets import (
         QApplication,
@@ -163,6 +166,51 @@ DEFAULT_FOLDER_PREFERENCES = {
     "export": "0.Prepped",
     "rejected": "rejected",
 }
+OLD_DEFAULT_CAPTION_TEMPLATE = "<trigger>, a clear image of a <subject_type>, <framing>, <hair>, <outfit>, <setting>, <lighting>"
+DEFAULT_CAPTION_TEMPLATE = "<trigger>, a clear image of a <subject_type>, <framing>, <angle>, <direction>, <expression>, <hair>, <outfit>, <setting>, <lighting>"
+DEFAULT_CAPTION_PROMPT = (
+    "Write exactly one concise LoRA dataset caption for this image. "
+    "The caption must start with '<trigger>,' exactly. "
+    "Describe only visible content. Do not mention file names, camera metadata, or uncertainty. "
+    "Training target profile: <profile>. "
+    "Preferred caption shape/template: <template>"
+)
+LOCAL_SERVER_MODEL_PRESETS = {
+    "Ollama": ["qwen3.5:4b", "qwen3.5:2b", "llama3.2-vision", "gemma4", "Custom..."],
+    "LM Studio": ["loaded-model", "Custom..."],
+    "KoboldCPP": ["loaded-model", "Custom..."],
+    "Custom OpenAI-compatible": ["loaded-model", "Custom..."],
+    "Custom JSON": ["custom-vision-model", "Custom..."],
+}
+API_MODEL_PRESETS = {
+    "OpenAI": [
+        "gpt-4.1-mini",
+        "gpt-4.1",
+        "gpt-4o-mini",
+        "gpt-4o",
+        "Custom...",
+    ],
+    "Gemini": [
+        "gemini-1.5-flash",
+        "gemini-1.5-pro",
+        "gemini-2.0-flash",
+        "gemini-2.5-flash",
+        "gemini-2.5-pro",
+        "Custom...",
+    ],
+    "Anthropic": [
+        "claude-3-5-haiku-latest",
+        "claude-3-5-sonnet-latest",
+        "claude-3-7-sonnet-latest",
+        "claude-sonnet-4-0",
+        "claude-opus-4-0",
+        "Custom...",
+    ],
+    "Custom HTTP": [
+        "custom-vision-model",
+        "Custom...",
+    ],
+}
 FOLDER_PREFERENCE_LABELS = {
     "anchors": "Anchor/reference images",
     "project_images": "Project images",
@@ -174,8 +222,22 @@ FOLDER_PREFERENCE_LABELS = {
 }
 
 
+def built_in_caption_prompt_presets() -> dict[str, str]:
+    return {
+        "Default LoRA Caption": DEFAULT_CAPTION_PROMPT,
+    }
+
+
+def all_caption_prompt_presets(settings: dict[str, Any]) -> dict[str, str]:
+    presets = built_in_caption_prompt_presets()
+    custom = settings.get("caption_prompt_presets", {})
+    if isinstance(custom, dict):
+        presets.update({str(name): str(text) for name, text in custom.items()})
+    return presets
+
+
 def default_caption_model_registry() -> list[dict[str, str]]:
-    return [
+    registry = [
         {
             "name": "Qwen3-VL 8B",
             "backend": "Qwen3-VL 8B",
@@ -257,6 +319,36 @@ def default_caption_model_registry() -> list[dict[str, str]]:
             "notes": "Use with a custom command or manual download. Some Civitai downloads require an API token.",
         },
     ]
+    extra = [
+        ("Qwen3-VL 8B Thinking", "Qwen3-VL 8B", "Qwen/Qwen3-VL-8B-Thinking", "Reasoning-oriented Qwen3-VL variant. Usually heavier/slower than Instruct for simple captioning."),
+        ("Qwen3-VL 4B Thinking", "Qwen3-VL 4B", "Qwen/Qwen3-VL-4B-Thinking", "Reasoning-oriented 4B variant. Useful to compare caption detail/style against Instruct."),
+        ("Qwen3-VL 4B Instruct FP8", "Qwen3-VL 4B", "Qwen/Qwen3-VL-4B-Instruct-FP8", "FP8 quantized Qwen3-VL 4B. Smaller than BF16; verify runtime support."),
+        ("Qwen3-VL 4B Instruct GGUF", "Qwen3-VL 4B", "Qwen/Qwen3-VL-4B-Instruct-GGUF", "GGUF package for llama.cpp/Ollama-style local serving. Includes LLM and vision projector pieces."),
+        ("Qwen3-VL 2B Instruct", "Qwen3-VL 2B", "Qwen/Qwen3-VL-2B-Instruct", "Small Qwen3-VL dense model. Better for lower VRAM; quality may be lower."),
+        ("Qwen3-VL 2B Thinking", "Qwen3-VL 2B", "Qwen/Qwen3-VL-2B-Thinking", "Small reasoning-oriented Qwen3-VL variant."),
+        ("Florence-2 Base", "Florence-2", "microsoft/Florence-2-base", "Smaller Florence-2 caption/detection model. Often uses Transformers with trust_remote_code."),
+        ("Florence-2 Base FT", "Florence-2", "microsoft/Florence-2-base-ft", "Fine-tuned Florence-2 base variant."),
+        ("Florence-2 Large FT", "Florence-2", "microsoft/Florence-2-large-ft", "Fine-tuned Florence-2 large variant."),
+        ("BLIP Image Captioning Base", "BLIP", "Salesforce/blip-image-captioning-base", "Smaller classic BLIP captioning model."),
+        ("WD ViT Tagger v3", "WD14 tagger", "SmilingWolf/wd-vit-tagger-v3", "Anime/tag-model preset. Produces tags rather than prose."),
+        ("WD ConvNeXT Tagger v3", "WD14 tagger", "SmilingWolf/wd-convnext-tagger-v3", "Anime/tag-model preset. Produces tags rather than prose."),
+        ("WD EVA02 Large Tagger v3", "WD14 tagger", "SmilingWolf/wd-eva02-large-tagger-v3", "Larger WD tagger preset. Produces tags rather than prose."),
+    ]
+    for name, backend, repo, notes in extra:
+        folder_name = repo.split("/")[-1]
+        registry.append(
+            {
+                "name": name,
+                "backend": backend,
+                "provider": "Hugging Face",
+                "repo": repo,
+                "url": f"https://huggingface.co/{repo}",
+                "target_folder": str(DEFAULT_MODELS_DIR / folder_name),
+                "download_command": f"huggingface-cli download {repo} --local-dir models/{folder_name}",
+                "notes": notes,
+            }
+        )
+    return registry
 
 
 def ostris_model_arch_registry() -> list[dict[str, Any]]:
@@ -594,6 +686,159 @@ class EmptyManifest:
 
     def record_for(self, filename: str) -> dict[str, Any]:
         return ImageRecord(filename=filename).__dict__
+
+
+class CaptionWorker(QObject):
+    progress = Signal(int, str)
+    finished = Signal(int, object, object, bool, str)
+
+    def __init__(self, captioner, images: list[Path], trigger: str, mode: str, settings: dict[str, Any]) -> None:
+        super().__init__()
+        self.captioner = captioner
+        self.images = images
+        self.trigger = trigger
+        self.mode = mode
+        self.settings = settings
+        self.cancel_requested = False
+
+    def request_cancel(self) -> None:
+        self.cancel_requested = True
+
+    def run(self) -> None:
+        made = 0
+        failed: list[str] = []
+        records: list[tuple[str, str]] = []
+        cancelled = False
+        for index, image_path in enumerate(self.images, start=1):
+            if self.cancel_requested:
+                cancelled = True
+                break
+            try:
+                caption = self.captioner(image_path, self.trigger, self.mode, self.settings)
+                if not caption.strip():
+                    raise RuntimeError("caption backend returned empty text")
+                image_path.with_suffix(CAPTION_EXT).write_text(caption, encoding="utf-8")
+                records.append((image_path.name, caption))
+                made += 1
+            except Exception as exc:
+                failed.append(f"{image_path.name}: {exc}")
+            self.progress.emit(index, f"Generating captions: {image_path.name}")
+        self.finished.emit(made, failed, records, cancelled, self.mode)
+
+
+class SplitExportWorker(QObject):
+    progress = Signal(int, str)
+    finished = Signal(object, object, bool, int, object, str)
+
+    def __init__(
+        self,
+        inputs: list[Path],
+        mode: str,
+        output_text: str,
+        split_folder_name: str,
+        auto_detect: bool,
+        rows: int,
+        cols: int,
+        crop: int,
+        face_crops: dict[str, list[tuple[int, int, int, int]]],
+        manual_crops: dict[str, list[tuple[int, int, int, int]]],
+        naming_pattern: str,
+        final_export_dir: Path | None,
+        resize_final: bool,
+        resize_target: str,
+        resize_mode: str,
+    ) -> None:
+        super().__init__()
+        self.inputs = inputs
+        self.mode = mode
+        self.output_text = output_text
+        self.split_folder_name = split_folder_name
+        self.auto_detect = auto_detect
+        self.rows = rows
+        self.cols = cols
+        self.crop = crop
+        self.face_crops = face_crops
+        self.manual_crops = manual_crops
+        self.naming_pattern = naming_pattern
+        self.final_export_dir = final_export_dir
+        self.resize_final = resize_final
+        self.resize_target = resize_target
+        self.resize_mode = resize_mode
+        self.cancel_requested = False
+
+    def request_cancel(self) -> None:
+        self.cancel_requested = True
+
+    def run(self) -> None:
+        created: list[Path] = []
+        log: list[str] = []
+        cancelled = False
+        copied = 0
+        copy_failed: list[str] = []
+        for source_step, path in enumerate(self.inputs, start=1):
+            if self.cancel_requested:
+                cancelled = True
+                log.append("STOPPED: export cancelled before next source image.")
+                break
+            out_dir = Path(self.output_text) if self.output_text else path.parent / self.split_folder_name
+            try:
+                out_dir.mkdir(parents=True, exist_ok=True)
+                with Image.open(path) as image:
+                    if self.mode == "Grid / Sheet":
+                        rows, cols = detect_grid(image.width, image.height) if self.auto_detect else (self.rows, self.cols)
+                        boxes = grid_boxes(image.width, image.height, rows, cols, self.crop)
+                        mode_name = "grid"
+                    elif self.mode == "Face crops":
+                        boxes = self.face_crops.get(normalized_path_key(path), [])
+                        rows, cols = 1, max(1, len(boxes))
+                        mode_name = "face"
+                    else:
+                        boxes = self.manual_crops.get(normalized_path_key(path), [])
+                        rows, cols = 1, max(1, len(boxes))
+                        mode_name = "manual"
+                    if not boxes:
+                        log.append(f"SKIP {path.name}: no {mode_name} crop boxes")
+                    for index, box in enumerate(boxes, start=1):
+                        if self.cancel_requested:
+                            cancelled = True
+                            log.append(f"STOPPED {path.name}: export cancelled after {index - 1} crop(s).")
+                            break
+                        if box[2] <= box[0] or box[3] <= box[1]:
+                            log.append(f"FAILED {path.name} #{index}: empty geometry {box}")
+                            continue
+                        if crop_is_empty(image, box):
+                            log.append(f"ODD {path.name} #{index}: crop may be empty")
+                        row = ((index - 1) // cols) + 1
+                        col = ((index - 1) % cols) + 1
+                        name = self.naming_pattern.format(source_name=path.stem, row=f"{row:02d}", col=f"{col:02d}", index=f"{index:02d}", mode=mode_name)
+                        output = unique_path(out_dir / name)
+                        cell = image.crop(box)
+                        cell.save(output)
+                        created.append(output)
+                    if boxes:
+                        log.append(f"OK {path.name}: {len(boxes)} {mode_name} cut(s) to {out_dir}")
+            except Exception as exc:
+                log.append(f"FAILED {path.name}: {exc}")
+            self.progress.emit(source_step, f"Exporting cuts: {path.name}")
+            if cancelled:
+                break
+        if created and self.final_export_dir is not None and not cancelled:
+            self.final_export_dir.mkdir(parents=True, exist_ok=True)
+            for index, image_path in enumerate(created, start=1):
+                if self.cancel_requested:
+                    cancelled = True
+                    break
+                try:
+                    out_path = unique_path(self.final_export_dir / image_path.name)
+                    with Image.open(image_path) as image:
+                        output = resize_image(image.convert("RGB"), self.resize_target, self.resize_mode) if self.resize_final else image.convert("RGB")
+                        output.save(out_path)
+                    copied += 1
+                except Exception as exc:
+                    copy_failed.append(f"{image_path.name}: {exc}")
+                self.progress.emit(len(self.inputs), f"Copying cuts to final export: {image_path.name}")
+            log.append(f"FINAL EXPORT {self.final_export_dir}: copied {copied} file(s), skipped {len(copy_failed)}")
+        self.finished.emit(created, log, cancelled, copied, copy_failed, str(self.final_export_dir or ""))
 
 
 class AccentSelectionDelegate(QStyledItemDelegate):
@@ -1152,13 +1397,85 @@ def add_help(widget: QWidget, text: str) -> QWidget:
     return widget
 
 
+def human_size(num_bytes: int) -> str:
+    value = float(num_bytes)
+    for unit in ["B", "KB", "MB", "GB", "TB"]:
+        if value < 1024 or unit == "TB":
+            return f"{value:.1f} {unit}" if unit != "B" else f"{int(value)} B"
+        value /= 1024
+    return f"{num_bytes} B"
+
+
+def local_path_size(path: Path) -> int:
+    if not path.exists():
+        return 0
+    if path.is_file():
+        return path.stat().st_size
+    total = 0
+    for child in path.rglob("*"):
+        try:
+            if child.is_file():
+                total += child.stat().st_size
+        except Exception:
+            continue
+    return total
+
+
+def local_model_size_text(target_folder: str) -> str:
+    if not target_folder.strip():
+        return "Not downloaded"
+    size = local_path_size(Path(target_folder))
+    return human_size(size) if size > 0 else "Not downloaded"
+
+
+def model_target_downloaded(target_folder: str) -> bool:
+    if not target_folder.strip():
+        return False
+    path = Path(target_folder)
+    if not path.exists():
+        return False
+    if path.is_file():
+        return path.stat().st_size > 0
+    try:
+        return any(child.is_file() for child in path.rglob("*"))
+    except Exception:
+        return False
+
+
+def path_inside(child: Path, parent: Path) -> bool:
+    try:
+        child.resolve().relative_to(parent.resolve())
+        return True
+    except Exception:
+        return False
+
+
+def model_target_can_be_removed(target_folder: str, settings: dict[str, Any]) -> tuple[bool, str]:
+    if not target_folder.strip():
+        return False, "No target folder is configured."
+    target = Path(target_folder).resolve()
+    if not target.exists():
+        return False, "The target folder does not exist."
+    roots = [DEFAULT_MODELS_DIR.resolve()]
+    roots.extend(Path(path).resolve() for path in settings.get("caption_model_locations", []))
+    matching_roots = [root for root in roots if path_inside(target, root)]
+    if not matching_roots:
+        return False, "For safety, the app only removes model files inside the app models folder or configured caption model locations."
+    if any(target == root for root in matching_roots):
+        return False, "Refusing to remove an entire configured model root. Select a model sub-folder instead."
+    return True, ""
+
+
 class ModelRegistryDialog(QDialog):
     def __init__(self, settings: dict[str, Any], parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.settings = settings
         self.registry = [dict(item) for item in settings.get("caption_model_registry", default_caption_model_registry())]
+        self.download_process: QProcess | None = None
+        self.download_output = ""
         self.setWindowTitle("Caption Model Registry")
-        self.resize(980, 680)
+        self.resize(1380, 860)
+        self.setMinimumSize(1240, 780)
         layout = QVBoxLayout(self)
         split = QSplitter(Qt.Horizontal)
         layout.addWidget(split, 1)
@@ -1166,18 +1483,22 @@ class ModelRegistryDialog(QDialog):
         left = QWidget()
         left_layout = QVBoxLayout(left)
         self.model_list = QListWidget()
+        self.model_list.setMinimumWidth(500)
         self.model_list.currentRowChanged.connect(self.load_entry)
         left_layout.addWidget(self.model_list, 1)
         left_actions = QHBoxLayout()
         add_btn = QPushButton("Add")
         remove_btn = QPushButton("Remove")
         reset_btn = QPushButton("Reset Built-ins")
+        refresh_all_sizes = QPushButton("Refresh Local Sizes")
         add_btn.clicked.connect(self.add_entry)
         remove_btn.clicked.connect(self.remove_entry)
         reset_btn.clicked.connect(self.reset_builtins)
+        refresh_all_sizes.clicked.connect(self.refresh_all_local_sizes)
         left_actions.addWidget(add_help(add_btn, "Add a custom model preset."))
         left_actions.addWidget(add_help(remove_btn, "Remove the selected preset from local settings."))
         left_actions.addWidget(add_help(reset_btn, "Replace registry with current built-in starter presets."))
+        left_actions.addWidget(add_help(refresh_all_sizes, "Refresh local disk-size status for all registry entries."))
         left_layout.addLayout(left_actions)
         split.addWidget(left)
 
@@ -1191,7 +1512,10 @@ class ModelRegistryDialog(QDialog):
         self.provider.addItems(["Hugging Face", "Civitai", "GitHub", "Direct URL", "Local folder", "Other"])
         self.repo = QLineEdit()
         self.url = QLineEdit()
+        self.size = QLineEdit()
+        self.size.setReadOnly(True)
         self.target_folder = QLineEdit()
+        self.target_folder.editingFinished.connect(self.update_download_state)
         browse_target = QPushButton("Browse")
         browse_target.clicked.connect(self.browse_target_folder)
         target_row = QHBoxLayout()
@@ -1202,6 +1526,7 @@ class ModelRegistryDialog(QDialog):
         self.target_row.setLayout(target_row)
         self.download_command = QPlainTextEdit()
         self.download_command.setMinimumHeight(72)
+        self.download_command.textChanged.connect(self.update_download_state)
         self.notes = QPlainTextEdit()
         self.notes.setMinimumHeight(92)
         form.addRow("Name", add_help(self.name, "User-facing preset name."))
@@ -1209,6 +1534,7 @@ class ModelRegistryDialog(QDialog):
         form.addRow("Provider", add_help(self.provider, "Where the model/download information comes from."))
         form.addRow("Repo / model id", add_help(self.repo, "Provider repo ID, model ID, or package name."))
         form.addRow("Source URL", add_help(self.url, "Model card, Civitai page, GitHub repo, or direct download page."))
+        form.addRow("Local disk size", add_help(self.size, "Actual size currently found on local disk in the target folder."))
         form.addRow("Target folder", add_help(self.target_row, "Suggested local folder for this model."))
         form.addRow("Download command", add_help(self.download_command, "Editable command suggestion. The app does not run it automatically."))
         form.addRow("Notes / warnings", add_help(self.notes, "Size, license, dependency, privacy, or setup notes."))
@@ -1216,17 +1542,34 @@ class ModelRegistryDialog(QDialog):
         actions = QHBoxLayout()
         save_entry = QPushButton("Save Entry")
         use_entry = QPushButton("Use Selected")
+        self.download_btn = QPushButton("Download Model")
+        refresh_size = QPushButton("Refresh Local Size")
+        self.remove_local_btn = QPushButton("Remove Local Files")
         open_page = QPushButton("Open Source Page")
         save_entry.clicked.connect(self.save_current_entry)
         use_entry.clicked.connect(self.use_selected_entry)
+        self.download_btn.clicked.connect(self.download_selected_model)
+        refresh_size.clicked.connect(self.refresh_selected_size)
+        self.remove_local_btn.clicked.connect(self.remove_local_model_files)
         open_page.clicked.connect(self.open_source_page)
         actions.addWidget(add_help(save_entry, "Save edits to the selected registry entry."))
         actions.addWidget(add_help(use_entry, "Use this preset as the current local caption model selection."))
+        actions.addWidget(add_help(self.download_btn, "Run the editable download command. Disabled when the target folder already contains model files."))
+        actions.addWidget(add_help(refresh_size, "Recalculate the selected model's local disk size."))
+        actions.addWidget(add_help(self.remove_local_btn, "Remove the selected model files from local disk after confirmation."))
         actions.addWidget(add_help(open_page, "Open the model source page in your browser."))
         actions.addStretch(1)
         right_layout.addLayout(actions)
+        self.download_status = QLabel("Download idle.")
+        self.download_status.setWordWrap(True)
+        self.download_progress = QProgressBar()
+        self.download_progress.setRange(0, 100)
+        self.download_progress.setValue(0)
+        self.download_progress.setVisible(False)
+        right_layout.addWidget(self.download_status)
+        right_layout.addWidget(self.download_progress)
         split.addWidget(right)
-        split.setSizes([300, 680])
+        split.setSizes([540, 840])
 
         bottom = QHBoxLayout()
         save = QPushButton("Save Registry")
@@ -1243,7 +1586,12 @@ class ModelRegistryDialog(QDialog):
         current = max(0, self.model_list.currentRow())
         self.model_list.clear()
         for entry in self.registry:
-            self.model_list.addItem(f"{entry.get('name', 'Untitled')}  [{entry.get('provider', '')}]")
+            size = local_model_size_text(entry.get("target_folder", ""))
+            downloaded = model_target_downloaded(entry.get("target_folder", ""))
+            state = "downloaded" if downloaded else "not downloaded"
+            item = QListWidgetItem(f"{entry.get('name', 'Untitled')}  [{entry.get('provider', '')}]  {size}  {state}")
+            item.setForeground(QColor("#6dff8f" if downloaded else "#ff6d6d"))
+            self.model_list.addItem(item)
         if self.registry:
             self.model_list.setCurrentRow(min(current, len(self.registry) - 1))
 
@@ -1254,6 +1602,7 @@ class ModelRegistryDialog(QDialog):
             "provider": self.provider.currentText(),
             "repo": self.repo.text().strip(),
             "url": self.url.text().strip(),
+            "size": self.size.text().strip(),
             "target_folder": self.target_folder.text().strip(),
             "download_command": self.download_command.toPlainText().strip(),
             "notes": self.notes.toPlainText().strip(),
@@ -1269,8 +1618,10 @@ class ModelRegistryDialog(QDialog):
         self.repo.setText(entry.get("repo", ""))
         self.url.setText(entry.get("url", ""))
         self.target_folder.setText(entry.get("target_folder", str(DEFAULT_MODELS_DIR)))
+        self.size.setText(local_model_size_text(self.target_folder.text()))
         self.download_command.setPlainText(entry.get("download_command", ""))
         self.notes.setPlainText(entry.get("notes", ""))
+        self.update_download_state()
 
     def save_current_entry(self) -> None:
         row = self.model_list.currentRow()
@@ -1278,6 +1629,7 @@ class ModelRegistryDialog(QDialog):
             return
         self.registry[row] = self.entry_from_fields()
         self.refresh_list()
+        self.update_download_state()
 
     def add_entry(self) -> None:
         self.registry.append(
@@ -1287,6 +1639,7 @@ class ModelRegistryDialog(QDialog):
                 "provider": "Other",
                 "repo": "",
                 "url": "",
+                "size": "Unknown",
                 "target_folder": str(DEFAULT_MODELS_DIR / "custom-caption-model"),
                 "download_command": "",
                 "notes": "",
@@ -1305,10 +1658,160 @@ class ModelRegistryDialog(QDialog):
         self.registry = default_caption_model_registry()
         self.refresh_list()
 
+    def update_download_state(self) -> None:
+        if not hasattr(self, "download_btn"):
+            return
+        if self.download_process is not None:
+            self.download_btn.setEnabled(False)
+            if hasattr(self, "remove_local_btn"):
+                self.remove_local_btn.setEnabled(False)
+            self.download_btn.setText("Downloading...")
+            self.download_btn.setToolTip("A model download is already running.")
+            return
+        downloaded = model_target_downloaded(self.target_folder.text().strip())
+        has_command = bool(self.download_command.toPlainText().strip())
+        self.size.setText(local_model_size_text(self.target_folder.text()))
+        self.download_btn.setEnabled(has_command and not downloaded)
+        self.download_btn.setText("Already Downloaded" if downloaded else "Download Model")
+        self.download_btn.setToolTip(
+            "This target folder already contains files, so the app will not download the same model again."
+            if downloaded
+            else "Run the editable download command in a terminal window."
+        )
+        if hasattr(self, "remove_local_btn"):
+            self.remove_local_btn.setEnabled(downloaded)
+            self.remove_local_btn.setToolTip("Remove local model files from disk." if downloaded else "No local model files found at this target path.")
+
+    def download_selected_model(self) -> None:
+        entry = self.entry_from_fields()
+        target = entry.get("target_folder", "")
+        if model_target_downloaded(target):
+            QMessageBox.information(self, APP_NAME, f"Model already appears to be downloaded:\n\n{target}")
+            self.update_download_state()
+            return
+        command = entry.get("download_command", "").strip()
+        if not command:
+            QMessageBox.information(self, APP_NAME, "This registry entry has no download command.")
+            return
+        reply = QMessageBox.question(
+            self,
+            "Download Model",
+            f"Run this download command?\n\n{command}\n\nTarget:\n{target}",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if reply != QMessageBox.Yes:
+            return
+        try:
+            process = QProcess(self)
+            process.setWorkingDirectory(str(APP_DIR))
+            process.setProcessChannelMode(QProcess.MergedChannels)
+            process.readyReadStandardOutput.connect(self.capture_download_output)
+            process.readyReadStandardError.connect(self.capture_download_output)
+            process.finished.connect(self.download_finished)
+            self.download_process = process
+            self.download_output = ""
+            self.download_progress.setRange(0, 0)
+            self.download_progress.setVisible(True)
+            self.download_status.setText(f"Downloading {entry.get('name', 'model')}...")
+            self.update_download_state()
+            if sys.platform == "win32":
+                process.start("cmd.exe", ["/c", command])
+            else:
+                process.start("/bin/sh", ["-lc", command])
+            if not process.waitForStarted(5000):
+                raise RuntimeError("download command did not start")
+        except Exception as exc:
+            self.download_process = None
+            self.download_progress.setVisible(False)
+            self.update_download_state()
+            QMessageBox.warning(self, APP_NAME, f"Could not start download command:\n\n{exc}")
+            return
+        self.save_current_entry()
+        self.download_status.setText(f"Download running: {entry.get('name', 'model')}")
+
+    def capture_download_output(self) -> None:
+        if self.download_process is None:
+            return
+        text = bytes(self.download_process.readAllStandardOutput()).decode("utf-8", errors="replace")
+        if not text:
+            text = bytes(self.download_process.readAllStandardError()).decode("utf-8", errors="replace")
+        if text:
+            self.download_output = (self.download_output + text)[-4000:]
+            last_line = [line.strip() for line in self.download_output.replace("\r", "\n").splitlines() if line.strip()]
+            if last_line:
+                self.download_status.setText(last_line[-1][:240])
+
+    def download_finished(self, exit_code: int, _exit_status) -> None:
+        self.download_progress.setRange(0, 100)
+        self.download_progress.setValue(100 if exit_code == 0 else 0)
+        self.download_progress.setVisible(False)
+        self.download_process = None
+        self.refresh_list()
+        self.update_download_state()
+        if exit_code == 0:
+            self.download_status.setText("Download finished. Registry refreshed.")
+            QMessageBox.information(self, APP_NAME, "Model download finished.")
+        else:
+            self.download_status.setText(f"Download failed with exit code {exit_code}.")
+            QMessageBox.warning(self, APP_NAME, f"Model download failed with exit code {exit_code}.\n\n{self.download_output[-1500:]}")
+
+    def refresh_selected_size(self) -> None:
+        row = self.model_list.currentRow()
+        if row < 0 or row >= len(self.registry):
+            return
+        self.size.setText(local_model_size_text(self.target_folder.text()))
+        self.registry[row] = self.entry_from_fields()
+        self.refresh_list()
+        self.update_download_state()
+
+    def remove_local_model_files(self) -> None:
+        target = self.target_folder.text().strip()
+        allowed, reason = model_target_can_be_removed(target, self.settings)
+        if not allowed:
+            QMessageBox.warning(self, APP_NAME, reason)
+            return
+        path = Path(target).resolve()
+        size_text = local_model_size_text(str(path))
+        reply = QMessageBox.warning(
+            self,
+            "Remove Local Model Files",
+            f"Remove this local model from disk?\n\n{path}\n\nCurrent size: {size_text}\n\nThis cannot be undone.",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if reply != QMessageBox.Yes:
+            return
+        confirm, ok = QInputDialog.getText(self, "Confirm Remove", f"Type DELETE to remove:\n{path}")
+        if not ok or confirm != "DELETE":
+            return
+        try:
+            if path.is_file():
+                path.unlink()
+            else:
+                shutil.rmtree(path)
+        except Exception as exc:
+            QMessageBox.warning(self, APP_NAME, f"Could not remove local model files:\n\n{exc}")
+            return
+        self.size.setText("Not downloaded")
+        self.refresh_list()
+        self.update_download_state()
+        QMessageBox.information(self, APP_NAME, f"Removed local model files:\n\n{path}")
+
+    def refresh_all_local_sizes(self) -> None:
+        for index, entry in enumerate(self.registry):
+            entry["size"] = local_model_size_text(entry.get("target_folder", ""))
+            QApplication.processEvents()
+        self.refresh_list()
+        if self.registry:
+            self.load_entry(max(0, self.model_list.currentRow()))
+        QMessageBox.information(self, APP_NAME, "Local model sizes refreshed.")
+
     def browse_target_folder(self) -> None:
         folder = QFileDialog.getExistingDirectory(self, "Choose model target folder", self.target_folder.text() or str(DEFAULT_MODELS_DIR))
         if folder:
             self.target_folder.setText(folder)
+            self.update_download_state()
 
     def open_source_page(self) -> None:
         url = self.url.text().strip()
@@ -1327,33 +1830,36 @@ class ModelRegistryDialog(QDialog):
         self.settings["caption_model_registry"] = self.registry
         super().accept()
 
-
 class CaptionSettingsDialog(QDialog):
     def __init__(self, settings: dict[str, Any], parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.settings = settings
+        self.controls_ready = False
         self.setWindowTitle("Caption Settings")
-        self.resize(720, 560)
+        self.resize(980, 760)
+        self.setMinimumSize(900, 680)
         layout = QVBoxLayout(self)
-        form = QFormLayout()
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        content = QWidget()
+        form = QFormLayout(content)
         self.mode = QComboBox()
-        self.mode.addItems(["Manual / Template only", "Local model", "API model", "Custom command"])
+        self.mode.addItems(["Manual / Template only", "Local model", "Local server", "API model", "Custom command"])
         self.mode.setCurrentText(settings.get("caption_mode", "Manual / Template only"))
         self.profile = QComboBox()
         self.profile.addItems(["Z-Image Base/Turbo", "Flux-style LoRA", "SDXL character LoRA", "anime/tag models", "Unknown/custom"])
         self.profile.setCurrentText(settings.get("training_target_profile", "Unknown/custom"))
-        self.local_type = QComboBox()
-        self.local_type.addItems(["JoyCaption", "Qwen3-VL 8B", "Qwen3-VL 4B", "Qwen3-VL 2B", "Florence-2", "BLIP", "WD14 tagger"])
-        self.local_type.setCurrentText(settings.get("local_model_type", "JoyCaption"))
+        self.local_model = QComboBox()
         model_locations = settings.get("caption_model_locations", [])
         default_model_path = settings.get("model_path") or (model_locations[0] if model_locations else str(DEFAULT_MODELS_DIR))
         self.model_path = QLineEdit(default_model_path)
-        browse_model = QPushButton("Browse")
-        browse_model.clicked.connect(self.browse_model_path)
+        self.model_path.setReadOnly(True)
+        self.browse_model = QPushButton("Registry")
+        self.browse_model.clicked.connect(self.open_model_registry)
         model_row = QHBoxLayout()
         model_row.setContentsMargins(0, 0, 0, 0)
         model_row.addWidget(self.model_path, 1)
-        model_row.addWidget(browse_model)
+        model_row.addWidget(self.browse_model)
         self.model_path_row = QWidget()
         self.model_path_row.setLayout(model_row)
         self.device = QComboBox()
@@ -1363,36 +1869,77 @@ class CaptionSettingsDialog(QDialog):
         self.batch.setValue(int(settings.get("batch_size", 4)))
         self.api_provider = QComboBox()
         self.api_provider.addItems(["OpenAI", "Gemini", "Anthropic", "Custom HTTP"])
-        self.api_key = QLineEdit(settings.get("api_key", ""))
-        self.api_key.setEchoMode(QLineEdit.Password)
-        self.api_model = QLineEdit(settings.get("api_model", ""))
-        self.command = QLineEdit(settings.get("caption_command", 'python caption.py --image "{image}" --trigger "{trigger}"'))
+        self.api_provider.setCurrentText(settings.get("api_provider", "OpenAI"))
+        self.api_model = QComboBox()
+        self.api_model.setEditable(True)
+        self.refresh_api_model_presets(settings.get("api_model", ""))
+        self.local_server_provider = QComboBox()
+        self.local_server_provider.addItems(["Ollama", "LM Studio", "KoboldCPP", "Custom OpenAI-compatible", "Custom JSON"])
+        self.local_server_provider.setCurrentText(settings.get("local_server_provider", "Ollama"))
+        self.local_server_url = QLineEdit(settings.get("local_server_url", self.default_local_server_url(self.local_server_provider.currentText())))
+        self.local_server_model = QComboBox()
+        self.local_server_model.setEditable(True)
+        self.refresh_local_server_model_presets(settings.get("local_server_model", ""))
+        self.refresh_server_models_btn = QPushButton("Refresh Models")
+        self.refresh_server_models_btn.clicked.connect(self.refresh_local_server_models_from_host)
+        self.command = QLineEdit(settings.get("caption_command", 'python caption.py --image "{image}" --trigger "{trigger}" --prompt "{prompt}"'))
         self.timeout = QSpinBox()
         self.timeout.setRange(5, 3600)
         self.timeout.setValue(int(settings.get("caption_timeout", 120)))
         self.json_field = QLineEdit(settings.get("caption_json_field", "caption"))
-        self.template = QPlainTextEdit(settings.get("caption_template", "<trigger>, a clear image of a <subject_type>, <framing>, <hair>, <outfit>, <setting>, <lighting>"))
+        saved_template = settings.get("caption_template", DEFAULT_CAPTION_TEMPLATE)
+        if saved_template == OLD_DEFAULT_CAPTION_TEMPLATE:
+            saved_template = DEFAULT_CAPTION_TEMPLATE
+        self.template = QPlainTextEdit(saved_template)
         self.template.setMinimumHeight(90)
+        self.prompt_preset = QComboBox()
+        self.prompt_preset.setEditable(False)
+        self.caption_prompt = QPlainTextEdit(settings.get("caption_prompt", DEFAULT_CAPTION_PROMPT))
+        self.caption_prompt.setMinimumHeight(120)
+        self.load_prompt_presets()
+        prompt_buttons = QHBoxLayout()
+        self.load_prompt_btn = QPushButton("Load")
+        self.save_prompt_btn = QPushButton("Save")
+        self.remove_prompt_btn = QPushButton("Remove")
+        self.default_prompt_btn = QPushButton("Built-in Default")
+        self.load_prompt_btn.clicked.connect(self.load_selected_prompt_preset)
+        self.save_prompt_btn.clicked.connect(self.save_current_prompt_preset)
+        self.remove_prompt_btn.clicked.connect(self.remove_selected_prompt_preset)
+        self.default_prompt_btn.clicked.connect(self.restore_default_prompt_preset)
+        for button in [self.load_prompt_btn, self.save_prompt_btn, self.remove_prompt_btn, self.default_prompt_btn]:
+            prompt_buttons.addWidget(button)
+        self.prompt_button_row = QWidget()
+        self.prompt_button_row.setLayout(prompt_buttons)
         self.profile_note = QLabel("")
         self.profile_note.setWordWrap(True)
-        registry_btn = QPushButton("Model Registry")
-        registry_btn.clicked.connect(self.open_model_registry)
+        self.mode_note = QLabel("")
+        self.mode_note.setWordWrap(True)
+        self.registry_btn = QPushButton("Model Registry")
+        self.registry_btn.clicked.connect(self.open_model_registry)
         form.addRow("Caption mode", add_help(self.mode, "Choose how captions are generated. Manual/template mode never sends images anywhere."))
+        form.addRow("Active controls", self.mode_note)
         form.addRow("Training target profile", add_help(self.profile, "Editable recommendation profile; it suggests caption style and model defaults without locking them."))
-        form.addRow("Local model type", add_help(self.local_type, "Suggested local caption/tagger family. You can override this per project."))
-        form.addRow("Model path", add_help(self.model_path_row, "Folder or checkpoint path for the selected local caption backend. Defaults to the app-local models folder."))
-        form.addRow("Downloads", add_help(registry_btn, "Edit model download sources, repo IDs, target folders, and setup notes."))
+        form.addRow("Local model", add_help(self.local_model, "Only downloaded models from the Caption Model Registry are selectable here."))
+        form.addRow("Model path", add_help(self.model_path_row, "Read-only path for the selected downloaded local model."))
+        form.addRow("Downloads", add_help(self.registry_btn, "Edit model download sources, repo IDs, target folders, and setup notes."))
         form.addRow("Device", add_help(self.device, "Auto lets the backend choose CUDA when available."))
         form.addRow("Batch size", add_help(self.batch, "How many images to caption per backend call."))
         form.addRow("API provider", add_help(self.api_provider, "Images are sent to the selected provider when API mode is used."))
-        form.addRow("API key", add_help(self.api_key, "Stored locally in settings.json if you save it here."))
         form.addRow("API model", add_help(self.api_model, "Vision-capable model name for API captioning."))
+        form.addRow("Local server", add_help(self.local_server_provider, "Run captions through Ollama, LM Studio, KoboldCPP, or another local HTTP server."))
+        form.addRow("Server URL", add_help(self.local_server_url, "Local caption endpoint. Ollama usually uses http://localhost:11434/api/generate. LM Studio usually uses http://localhost:1234/v1/chat/completions."))
+        form.addRow("Server model", add_help(self.local_server_model, "Model name served by the local runtime. Refresh can pull visible models from Ollama or OpenAI-compatible /v1/models."))
+        form.addRow("Server model list", add_help(self.refresh_server_models_btn, "Refresh available models from the selected local server if it exposes a model list endpoint."))
         form.addRow("Custom command", add_help(self.command, 'Use placeholders like "{image}" and "{trigger}".'))
         form.addRow("Timeout seconds", add_help(self.timeout, "Maximum runtime for one custom command call."))
         form.addRow("JSON field", add_help(self.json_field, "If command output is JSON, read this field for the caption."))
         form.addRow("Template", add_help(self.template, "Manual captions replace <trigger> and other known fields with editable text."))
+        form.addRow("Prompt preset", add_help(self.prompt_preset, "Saved captioning prompt presets. Built-in presets cannot be deleted."))
+        form.addRow("Prompt preset actions", add_help(self.prompt_button_row, "Load, save, remove, or restore the built-in captioning prompt."))
+        form.addRow("Captioning prompt", add_help(self.caption_prompt, "Full prompt sent to API, local server, direct local model, or custom command. Supports <trigger>, <profile>, and <template>."))
         form.addRow("Profile suggestion", self.profile_note)
-        layout.addLayout(form)
+        scroll.setWidget(content)
+        layout.addWidget(scroll, 1)
         buttons = QHBoxLayout()
         save = QPushButton("Save")
         cancel = QPushButton("Cancel")
@@ -1402,22 +1949,173 @@ class CaptionSettingsDialog(QDialog):
         buttons.addWidget(save)
         buttons.addWidget(cancel)
         layout.addLayout(buttons)
+        self.refresh_local_model_options()
         self.profile.currentTextChanged.connect(self.update_profile_note)
+        self.local_model.currentIndexChanged.connect(self.local_model_changed)
+        self.api_provider.currentTextChanged.connect(self.refresh_api_model_presets)
+        self.local_server_provider.currentTextChanged.connect(self.local_server_provider_changed)
+        self.mode.currentTextChanged.connect(self.update_mode_controls)
         self.update_profile_note(self.profile.currentText())
+        self.controls_ready = True
+        self.update_mode_controls(self.mode.currentText())
 
     def browse_model_path(self) -> None:
-        start = self.model_path.text().strip() or str(DEFAULT_MODELS_DIR)
-        folder = QFileDialog.getExistingDirectory(self, "Choose caption model folder", start)
-        if folder:
-            self.model_path.setText(folder)
+        self.open_model_registry()
 
     def open_model_registry(self) -> None:
         dialog = ModelRegistryDialog(self.settings, self)
         if dialog.exec():
             preset = self.settings.get("selected_caption_model_preset", "")
-            self.local_type.setCurrentText(self.settings.get("local_model_type", self.local_type.currentText()))
+            self.refresh_local_model_options()
             self.model_path.setText(self.settings.get("model_path", self.model_path.text()))
             self.profile_note.setText(f"Selected model preset: {preset}" if preset else self.profile_note.text())
+
+    def downloaded_model_entries(self) -> list[dict[str, str]]:
+        entries = [dict(item) for item in self.settings.get("caption_model_registry", default_caption_model_registry())]
+        return [entry for entry in entries if model_target_downloaded(entry.get("target_folder", ""))]
+
+    def refresh_local_model_options(self) -> None:
+        current_name = self.settings.get("selected_caption_model_preset", "")
+        current_path = self.settings.get("model_path", "")
+        self.local_model.blockSignals(True)
+        self.local_model.clear()
+        entries = self.downloaded_model_entries()
+        if not entries:
+            self.local_model.addItem("No downloaded local models", {})
+            self.local_model.setEnabled(False)
+            if hasattr(self, "model_path"):
+                self.model_path.setText("")
+            self.local_model.blockSignals(False)
+            return
+        for entry in entries:
+            label = f"{entry.get('name', 'Untitled')}  [{entry.get('backend', 'Local model')}]"
+            self.local_model.addItem(label, entry)
+        selected = 0
+        for index, entry in enumerate(entries):
+            if entry.get("name") == current_name or entry.get("target_folder") == current_path:
+                selected = index
+                break
+        self.local_model.setCurrentIndex(selected)
+        self.local_model.setEnabled(True)
+        self.local_model.blockSignals(False)
+        self.local_model_changed(self.local_model.currentIndex())
+
+    def local_model_changed(self, _index: int) -> None:
+        entry = self.local_model.currentData()
+        if not isinstance(entry, dict):
+            self.model_path.setText("")
+            return
+        self.model_path.setText(entry.get("target_folder", ""))
+        self.settings["local_model_type"] = entry.get("backend", "")
+        self.settings["model_path"] = entry.get("target_folder", "")
+        self.settings["selected_caption_model_preset"] = entry.get("name", "")
+
+    def default_local_server_url(self, provider: str) -> str:
+        defaults = {
+            "Ollama": "http://localhost:11434/api/generate",
+            "LM Studio": "http://localhost:1234/v1/chat/completions",
+            "KoboldCPP": "http://localhost:5001/v1/chat/completions",
+            "Custom OpenAI-compatible": "http://localhost:1234/v1/chat/completions",
+            "Custom JSON": "http://localhost:5000/caption",
+        }
+        return defaults.get(provider, defaults["Ollama"])
+
+    def local_server_provider_changed(self, provider: str) -> None:
+        known_defaults = {self.default_local_server_url(name) for name in LOCAL_SERVER_MODEL_PRESETS}
+        if not self.local_server_url.text().strip() or self.local_server_url.text().strip() in known_defaults:
+            self.local_server_url.setText(self.default_local_server_url(provider))
+        self.refresh_local_server_model_presets(self.local_server_model.currentText().strip())
+        self.update_mode_controls(self.mode.currentText())
+
+    def refresh_local_server_model_presets(self, preferred: str = "") -> None:
+        current = preferred or self.local_server_model.currentText().strip()
+        provider = self.local_server_provider.currentText() if hasattr(self, "local_server_provider") else "Ollama"
+        presets = LOCAL_SERVER_MODEL_PRESETS.get(provider, LOCAL_SERVER_MODEL_PRESETS["Ollama"])
+        self.local_server_model.blockSignals(True)
+        self.local_server_model.clear()
+        self.local_server_model.addItems(presets)
+        if current:
+            if current not in presets:
+                self.local_server_model.addItem(current)
+            self.local_server_model.setCurrentText(current)
+        elif presets:
+            self.local_server_model.setCurrentIndex(0)
+        self.local_server_model.blockSignals(False)
+
+    def local_server_model_list_url(self) -> str:
+        provider = self.local_server_provider.currentText()
+        url = self.local_server_url.text().strip()
+        if provider == "Ollama":
+            return url.replace("/api/generate", "/api/tags").replace("/api/chat", "/api/tags")
+        if url.endswith("/chat/completions"):
+            return url.rsplit("/chat/completions", 1)[0] + "/models"
+        return url.rstrip("/") + "/v1/models"
+
+    def refresh_local_server_models_from_host(self) -> None:
+        try:
+            request = urllib.request.Request(self.local_server_model_list_url(), method="GET")
+            with urllib.request.urlopen(request, timeout=10) as response:
+                data = json.loads(response.read().decode("utf-8", errors="replace"))
+            if self.local_server_provider.currentText() == "Ollama":
+                names = [str(item.get("name", "")) for item in data.get("models", []) if item.get("name")]
+            else:
+                names = [str(item.get("id", "")) for item in data.get("data", []) if item.get("id")]
+            if not names:
+                raise ValueError("no models returned")
+            current = self.local_server_model.currentText().strip()
+            self.local_server_model.blockSignals(True)
+            self.local_server_model.clear()
+            self.local_server_model.addItems(names + ["Custom..."])
+            if current and current in names:
+                self.local_server_model.setCurrentText(current)
+            self.local_server_model.blockSignals(False)
+        except Exception as exc:
+            QMessageBox.warning(self, APP_NAME, f"Could not refresh local server models:\n\n{exc}")
+
+    def load_prompt_presets(self) -> None:
+        presets = all_caption_prompt_presets(self.settings)
+        selected = self.settings.get("caption_prompt_preset", "Default LoRA Caption")
+        self.prompt_preset.blockSignals(True)
+        self.prompt_preset.clear()
+        self.prompt_preset.addItems(list(presets.keys()))
+        if selected in presets:
+            self.prompt_preset.setCurrentText(selected)
+        self.prompt_preset.blockSignals(False)
+
+    def load_selected_prompt_preset(self) -> None:
+        presets = all_caption_prompt_presets(self.settings)
+        name = self.prompt_preset.currentText()
+        if name in presets:
+            self.caption_prompt.setPlainText(presets[name])
+            self.settings["caption_prompt_preset"] = name
+
+    def save_current_prompt_preset(self) -> None:
+        name, ok = QInputDialog.getText(self, "Save Caption Prompt", "Preset name:", text=self.prompt_preset.currentText() or "My Caption Prompt")
+        if not ok or not name.strip():
+            return
+        name = name.strip()
+        if name in built_in_caption_prompt_presets():
+            QMessageBox.warning(self, APP_NAME, "Built-in prompt presets cannot be overwritten. Save this as a new preset name.")
+            return
+        self.settings.setdefault("caption_prompt_presets", {})[name] = self.caption_prompt.toPlainText()
+        self.settings["caption_prompt_preset"] = name
+        self.load_prompt_presets()
+
+    def remove_selected_prompt_preset(self) -> None:
+        name = self.prompt_preset.currentText()
+        if name in built_in_caption_prompt_presets():
+            QMessageBox.information(self, APP_NAME, "Built-in prompt presets cannot be removed.")
+            return
+        custom = self.settings.setdefault("caption_prompt_presets", {})
+        if name in custom and QMessageBox.question(self, APP_NAME, f"Remove caption prompt preset '{name}'?") == QMessageBox.Yes:
+            custom.pop(name, None)
+            self.settings["caption_prompt_preset"] = "Default LoRA Caption"
+            self.load_prompt_presets()
+            self.load_selected_prompt_preset()
+
+    def restore_default_prompt_preset(self) -> None:
+        self.prompt_preset.setCurrentText("Default LoRA Caption")
+        self.load_selected_prompt_preset()
 
     def update_profile_note(self, profile: str) -> None:
         notes = {
@@ -1429,22 +2127,82 @@ class CaptionSettingsDialog(QDialog):
         }
         self.profile_note.setText(notes.get(profile, ""))
 
+    def refresh_api_model_presets(self, preferred: str = "") -> None:
+        current = preferred if preferred and preferred not in API_MODEL_PRESETS else self.api_model.currentText().strip()
+        provider = self.api_provider.currentText()
+        presets = API_MODEL_PRESETS.get(provider, API_MODEL_PRESETS["OpenAI"])
+        self.api_model.blockSignals(True)
+        self.api_model.clear()
+        self.api_model.addItems(presets)
+        if current:
+            if current not in presets:
+                self.api_model.addItem(current)
+            self.api_model.setCurrentText(current)
+        elif presets:
+            self.api_model.setCurrentIndex(0)
+        self.api_model.blockSignals(False)
+        if getattr(self, "controls_ready", False):
+            self.update_mode_controls(self.mode.currentText())
+
+    def set_mode_widget_enabled(self, widget: QWidget, enabled: bool, tooltip: str) -> None:
+        widget.setEnabled(enabled)
+        widget.setProperty("modeInactive", not enabled)
+        widget.setToolTip(tooltip)
+        widget.style().unpolish(widget)
+        widget.style().polish(widget)
+        for child in widget.findChildren(QWidget):
+            child.setProperty("modeInactive", not enabled)
+            child.style().unpolish(child)
+            child.style().polish(child)
+
+    def update_mode_controls(self, mode: str) -> None:
+        local_enabled = mode == "Local model"
+        local_server_enabled = mode == "Local server"
+        api_enabled = mode == "API model"
+        custom_enabled = mode == "Custom command"
+        timeout_enabled = mode in {"Local model", "Local server", "API model", "Custom command"}
+
+        for widget in [self.local_model, self.model_path_row, self.registry_btn, self.device, self.batch]:
+            self.set_mode_widget_enabled(widget, local_enabled, "Enabled only when Caption mode is Local model.")
+        for widget in [self.local_server_provider, self.local_server_url, self.local_server_model, self.refresh_server_models_btn]:
+            self.set_mode_widget_enabled(widget, local_server_enabled, "Enabled only when Caption mode is Local server.")
+        for widget in [self.api_provider, self.api_model]:
+            self.set_mode_widget_enabled(widget, api_enabled, "Enabled only when Caption mode is API model.")
+        self.set_mode_widget_enabled(self.command, custom_enabled, 'Enabled only when Caption mode is Custom command. Use placeholders like "{image}", "{trigger}", and "{prompt}".')
+        self.set_mode_widget_enabled(self.timeout, timeout_enabled, "Used by API model, Local command, and Custom command captioning.")
+        self.set_mode_widget_enabled(self.json_field, custom_enabled or (api_enabled and self.api_provider.currentText() == "Custom HTTP") or (local_server_enabled and self.local_server_provider.currentText() == "Custom JSON"), "Used for Custom command JSON output, Custom HTTP API responses, or Custom JSON local server responses.")
+        if mode == "API model":
+            self.mode_note.setText("API mode is active. API provider/model controls are enabled; local model downloads, model path, device, batch, and custom command controls are intentionally disabled.")
+        elif mode == "Local model":
+            self.mode_note.setText("Local model mode is active. Only downloaded registry models can be selected; API provider/model and custom command controls are intentionally disabled.")
+        elif mode == "Local server":
+            self.mode_note.setText("Local server mode is active. Ollama, LM Studio, KoboldCPP, or custom local endpoint controls are enabled; direct local model and cloud API controls are intentionally disabled.")
+        elif mode == "Custom command":
+            self.mode_note.setText("Custom command mode is active. Command, timeout, and JSON parsing controls are enabled; local model and API model controls are intentionally disabled.")
+        else:
+            self.mode_note.setText("Manual/template mode is active. Backend-specific controls are disabled because no model or API is used.")
+
     def accept(self) -> None:
         self.settings.update(
             {
                 "caption_mode": self.mode.currentText(),
                 "training_target_profile": self.profile.currentText(),
-                "local_model_type": self.local_type.currentText(),
+                "local_model_type": self.settings.get("local_model_type", ""),
                 "model_path": self.model_path.text(),
+                "selected_caption_model_preset": self.settings.get("selected_caption_model_preset", ""),
                 "device": self.device.currentText(),
                 "batch_size": self.batch.value(),
+                "local_server_provider": self.local_server_provider.currentText(),
+                "local_server_url": self.local_server_url.text().strip(),
+                "local_server_model": "" if self.local_server_model.currentText() == "Custom..." else self.local_server_model.currentText().strip(),
                 "api_provider": self.api_provider.currentText(),
-                "api_key": self.api_key.text(),
-                "api_model": self.api_model.text(),
+                "api_model": "" if self.api_model.currentText() == "Custom..." else self.api_model.currentText().strip(),
                 "caption_command": self.command.text(),
                 "caption_timeout": self.timeout.value(),
                 "caption_json_field": self.json_field.text(),
                 "caption_template": self.template.toPlainText(),
+                "caption_prompt": self.caption_prompt.toPlainText(),
+                "caption_prompt_preset": self.prompt_preset.currentText(),
             }
         )
         super().accept()
@@ -1461,6 +2219,10 @@ class MainWindow(QMainWindow):
         self.settings["folder_preferences"] = clean_folder_preferences(self.settings.get("folder_preferences"))
         self.dataset_root: Path | None = None
         self.manifest: Manifest | EmptyManifest = EmptyManifest()
+        self.caption_thread: QThread | None = None
+        self.caption_worker: CaptionWorker | None = None
+        self.split_thread: QThread | None = None
+        self.split_worker: SplitExportWorker | None = None
         self.split_inputs: list[Path] = []
         self.split_outputs: list[Path] = []
         self.split_current: Path | None = None
@@ -1469,6 +2231,7 @@ class MainWindow(QMainWindow):
         self.cancel_requested = False
         self.current_dataset_image: Path | None = None
         self.syncing_yaml = False
+        self.local_caption_cache: dict[str, Any] = {}
         app = QApplication.instance()
         if app is not None:
             app.installEventFilter(self)
@@ -1549,6 +2312,22 @@ class MainWindow(QMainWindow):
             QPushButton:hover, QToolButton:hover {{ background: {t['button_active']}; border-color: #3a3a3a; }}
             QPushButton:pressed, QToolButton:pressed {{ background: {t['field']}; border-color: {t['accent']}; }}
             QLineEdit, QPlainTextEdit, QTextEdit, QListWidget, QSpinBox, QComboBox {{ background: {t['field']}; color: {t['text']}; border: 1px solid {t['border']}; border-radius: 8px; padding: 5px; selection-background-color: {t['accent']}; selection-color: #101010; }}
+            QPushButton:disabled, QToolButton:disabled, QLineEdit:disabled, QPlainTextEdit:disabled, QTextEdit:disabled, QSpinBox:disabled, QComboBox:disabled {{
+                background: #080808;
+                color: #555555;
+                border: 1px dashed #3a3a3a;
+            }}
+            QWidget[modeInactive="true"] QLineEdit,
+            QWidget[modeInactive="true"] QComboBox,
+            QWidget[modeInactive="true"] QPushButton,
+            QComboBox[modeInactive="true"],
+            QLineEdit[modeInactive="true"],
+            QSpinBox[modeInactive="true"],
+            QPushButton[modeInactive="true"] {{
+                background: #070707;
+                color: #4f4f4f;
+                border: 1px dashed #444444;
+            }}
             QListWidget::item:selected {{ background: {t['accent']}; color: #101010; border: 1px solid {t['accent']}; border-radius: 6px; }}
             QListWidget::item:hover {{ background: {t['button_active']}; border-radius: 6px; }}
             QTabWidget::pane {{ border: 1px solid {t['border']}; border-radius: 8px; top: -1px; }}
@@ -1577,7 +2356,8 @@ class MainWindow(QMainWindow):
         self.progress_bar.setFormat(f"{label} %p%")
         self.progress_bar.setVisible(True)
         self.status.setText(label)
-        QApplication.processEvents()
+        if QThread.currentThread() == QApplication.instance().thread():
+            QApplication.processEvents()
 
     def update_progress(self, value: int, label: str | None = None) -> None:
         if not hasattr(self, "progress_bar"):
@@ -1585,7 +2365,8 @@ class MainWindow(QMainWindow):
         self.progress_bar.setValue(value)
         if label:
             self.status.setText(label)
-        QApplication.processEvents()
+        if QThread.currentThread() == QApplication.instance().thread():
+            QApplication.processEvents()
 
     def end_progress(self, label: str = "") -> None:
         if not hasattr(self, "progress_bar"):
@@ -1593,7 +2374,8 @@ class MainWindow(QMainWindow):
         self.progress_bar.setValue(self.progress_bar.maximum())
         if label:
             self.status.setText(label)
-        QApplication.processEvents()
+        if QThread.currentThread() == QApplication.instance().thread():
+            QApplication.processEvents()
         self.progress_bar.setVisible(False)
 
     def folder_preferences(self) -> dict[str, str]:
@@ -1689,6 +2471,10 @@ class MainWindow(QMainWindow):
 
     def request_cancel(self) -> None:
         self.cancel_requested = True
+        if self.caption_worker is not None:
+            self.caption_worker.request_cancel()
+        if self.split_worker is not None:
+            self.split_worker.request_cancel()
         self.status.setText("Stopping after the current item...")
         QApplication.processEvents()
 
@@ -1852,7 +2638,7 @@ class MainWindow(QMainWindow):
         manual_actions.addWidget(clear_crops)
         self.manual_actions_row = QWidget()
         self.manual_actions_row.setLayout(manual_actions)
-        self.split_resize = QCheckBox("Resize each cell")
+        self.split_resize = QCheckBox("Resize final export copy")
         self.split_resize_preset = QComboBox()
         self.split_resize_preset.addItems([f"{size}x{size}" for size in range(256, 2049, 256)] + ["Custom"])
         self.split_resize_preset.setCurrentText("1024x1024")
@@ -1889,8 +2675,8 @@ class MainWindow(QMainWindow):
         form.addRow("Manual crops", add_help(self.manual_crop_list, "Draw boxes on the preview. Select a crop here to inspect or delete it."))
         form.addRow("Crop ratio", add_help(self.crop_ratio, "Constrain manual crop boxes and face-detected crop boxes to this aspect ratio."))
         form.addRow(add_help(self.manual_actions_row, "Delete or clear manual crops for the selected source image."))
-        form.addRow(add_help(self.split_resize, "Optionally resize cut cells during split."))
-        form.addRow("Resize target", add_help(self.split_resize_row, "Choose a square preset from 256x256 through 2048x2048, or choose Custom and type WIDTHxHEIGHT."))
+        form.addRow(add_help(self.split_resize, "Keep split files at their original crop size. Resize only the copy that goes to the final export/prepped folder."))
+        form.addRow("Final export target", add_help(self.split_resize_row, "Choose the resize target for the final export/prepped copy. The split folder keeps original crop dimensions."))
         form.addRow("Naming pattern", add_help(self.naming_pattern, "Controls exported cell filenames."))
         form.addRow("Output folder", out_row)
         controls_scroll = QScrollArea()
@@ -1973,7 +2759,7 @@ class MainWindow(QMainWindow):
 
         quick = QHBoxLayout()
         self.caption_mode = QComboBox()
-        self.caption_mode.addItems(["Manual / Template only", "Local model", "API model", "Custom command"])
+        self.caption_mode.addItems(["Manual / Template only", "Local model", "Local server", "API model", "Custom command"])
         self.caption_mode.setCurrentText(self.manifest.data.get("caption_mode", "Manual / Template only"))
         self.trigger_edit = QLineEdit(self.manifest.data.get("trigger", ""))
         caption_settings = QPushButton("Caption Settings")
@@ -1988,7 +2774,7 @@ class MainWindow(QMainWindow):
         quick.addWidget(add_help(self.caption_mode, "Quick caption mode selection; detailed backend setup lives in Caption Settings."))
         quick.addWidget(QLabel("Trigger token"))
         quick.addWidget(add_help(self.trigger_edit, "Required. Generated captions start with this exact token followed by a comma."), 1)
-        for button, tip in [(caption_settings, "Configure manual, local, API, or custom command captioning."), (generate, "Generate captions for selected prepped images."), (validate, "Run image/caption/integrity checks on the current prepped folder."), (export, "Resize/copy split images into the configured prepped folder or a versioned folder.")]:
+        for button, tip in [(caption_settings, "Configure manual, local, API, or custom command captioning."), (generate, "Generate captions for selected prepped images."), (validate, "Run image/caption/integrity checks on the current prepped folder."), (export, "Apply the selected resize settings to the current final export/prepped folder.")]:
             quick.addWidget(add_help(button, tip))
         layout.addLayout(quick)
 
@@ -2183,7 +2969,7 @@ class MainWindow(QMainWindow):
               td, th {{ border: 1px solid #555; padding: 5px 8px; }}
             </style>
             <h1>PrepMI-PrepYU Guide</h1>
-            <p><b>Short version:</b> this app is for turning messy image folders and sheets into a LoRA-ready project. Pick or import a project, split what needs splitting, copy the split images into the prepped folder, caption those actual prepped files, validate them, then make an Ostris config you can manually load in AI Toolkit.</p>
+            <p><b>Short version:</b> this app is for turning messy image folders and sheets into a LoRA-ready project. Pick or import a project, split what needs splitting, let split export fill the prepped folder, caption those actual prepped files, validate them, then make an Ostris config you can manually load in AI Toolkit.</p>
 
             {guide_img("dataset_prep.png", "Dataset Prep: project selection, review grid, preview, captions, and export controls.")}
 
@@ -2222,7 +3008,7 @@ manifest.json</pre>
             <ol>
               <li>Put raw sheets and source images in the configured source folder. Default: <code>dataset\\</code>.</li>
               <li>Cut/split source images into the configured split folder. Default: <code>dataset\\split\\</code>.</li>
-              <li>Click <b>Export Final Dataset</b> to resize/copy those split images into the configured prepped folder. Default: <code>0.Prepped</code>.</li>
+              <li>Run Cut / Split export to copy split images into the configured prepped folder. Default: <code>0.Prepped</code>.</li>
               <li>Add captions for the prepped files. Captions must start with <code>&lt;trigger&gt;,</code> exactly.</li>
               <li>Run <b>Validate Everything</b>.</li>
             </ol>
@@ -2249,6 +3035,7 @@ manifest.json</pre>
               <tr><td>Manual crop: left-drag empty preview</td><td>Create the one crop box for that image.</td></tr>
               <tr><td>Manual crop: left-drag inside box</td><td>Move the existing crop box.</td></tr>
               <tr><td>Manual crop: right-click inside box</td><td>Remove the crop box.</td></tr>
+              <tr><td>Image lists/grids: Ctrl+A, Shift-click, Ctrl-click</td><td>Use the normal Windows Explorer selection moves: select all, select a range, or add/remove individual images from the selection.</td></tr>
               <tr><td>Mouse wheel over text fields/dropdowns/spinners</td><td>Does not change values. This is intentional, because accidental scroll edits are terrible.</td></tr>
               <tr><td>Ctrl+A in text editors</td><td>Select text normally.</td></tr>
               <tr><td>Standard text shortcuts</td><td>Copy/paste/undo/redo work where Qt text fields support them.</td></tr>
@@ -2259,7 +3046,7 @@ manifest.json</pre>
               <li>Create or drop/import a project.</li>
               <li>Put raw sheets/source images in the configured project image folder.</li>
               <li>Use Cut / Split if sheets, faces, or manual crops need cleanup.</li>
-              <li>Export split images into the prepped folder.</li>
+              <li>Use Cut / Split export to fill the prepped folder.</li>
               <li>Review and caption the prepped images in Dataset Prep with a real trigger token. No surprise trigger magic.</li>
               <li>Validate everything.</li>
               <li>Build/tweak Ostris YAML and run it manually in AI Toolkit.</li>
@@ -3363,12 +4150,13 @@ manifest.json</pre>
             self.split_output.setText(folder)
 
     def export_split_cuts(self) -> None:
+        if self.split_thread is not None and self.split_thread.isRunning():
+            QMessageBox.information(self, APP_NAME, "Cut export is already running.")
+            return
         if not self.split_inputs:
             self.load_split_images()
             if not self.split_inputs:
                 return
-        created: list[Path] = []
-        log: list[str] = []
         mode = self.cut_mode.currentText()
         total_sources = len(self.split_inputs)
         self.cancel_requested = False
@@ -3377,56 +4165,40 @@ manifest.json</pre>
         if hasattr(self, "split_stop_button"):
             self.split_stop_button.setEnabled(True)
         self.begin_progress("Exporting cuts", total_sources)
-        cancelled = False
-        for source_step, path in enumerate(self.split_inputs, start=1):
-            if self.cancel_requested:
-                cancelled = True
-                log.append("STOPPED: export cancelled before next source image.")
-                break
-            out_dir = Path(self.split_output.text()) if self.split_output.text() else path.parent / Path(self.folder_rel("split")).name
-            out_dir.mkdir(parents=True, exist_ok=True)
-            with Image.open(path) as image:
-                if mode == "Grid / Sheet":
-                    rows, cols = detect_grid(image.width, image.height) if self.auto_detect.isChecked() else (self.split_rows.value(), self.split_cols.value())
-                    boxes = grid_boxes(image.width, image.height, rows, cols, self.split_crop())
-                    mode_name = "grid"
-                elif mode == "Face crops":
-                    rows, cols = 1, max(1, len(self.split_face_crops.get(normalized_path_key(path), [])))
-                    boxes = self.split_face_crops.get(normalized_path_key(path), [])
-                    mode_name = "face"
-                else:
-                    rows, cols = 1, max(1, len(self.split_manual_crops.get(normalized_path_key(path), [])))
-                    boxes = self.split_manual_crops.get(normalized_path_key(path), [])
-                    mode_name = "manual"
-                if not boxes:
-                    log.append(f"SKIP {path.name}: no {mode_name} crop boxes")
-                    continue
-                for index, box in enumerate(boxes, start=1):
-                    if self.cancel_requested:
-                        cancelled = True
-                        log.append(f"STOPPED {path.name}: export cancelled after {index - 1} crop(s).")
-                        break
-                    if box[2] <= box[0] or box[3] <= box[1]:
-                        log.append(f"FAILED {path.name} #{index}: empty geometry {box}")
-                        continue
-                    if crop_is_empty(image, box):
-                        log.append(f"ODD {path.name} #{index}: crop may be empty")
-                    row = ((index - 1) // cols) + 1
-                    col = ((index - 1) % cols) + 1
-                    name = self.naming_pattern.currentText().format(source_name=path.stem, row=f"{row:02d}", col=f"{col:02d}", index=f"{index:02d}", mode=mode_name)
-                    output = unique_path(out_dir / name)
-                    cell = image.crop(box)
-                    if self.split_resize.isChecked():
-                        cell = resize_image(cell, self.split_resize_target(), "Center crop")
-                    cell.save(output)
-                    created.append(output)
-                    QApplication.processEvents()
-                if cancelled:
-                    break
-                log.append(f"OK {path.name}: {len(boxes)} {mode_name} cut(s) to {out_dir}")
-            self.update_progress(source_step, f"Exporting cuts: {path.name}")
-            if cancelled:
-                break
+        final_export_dir = self.project_folder("export") if self.dataset_root is not None else None
+        self.split_thread = QThread(self)
+        self.split_worker = SplitExportWorker(
+            inputs=list(self.split_inputs),
+            mode=mode,
+            output_text=self.split_output.text().strip(),
+            split_folder_name=Path(self.folder_rel("split")).name,
+            auto_detect=self.auto_detect.isChecked(),
+            rows=self.split_rows.value(),
+            cols=self.split_cols.value(),
+            crop=self.split_crop(),
+            face_crops={key: list(value) for key, value in self.split_face_crops.items()},
+            manual_crops={key: list(value) for key, value in self.split_manual_crops.items()},
+            naming_pattern=self.naming_pattern.currentText(),
+            final_export_dir=final_export_dir,
+            resize_final=self.split_resize.isChecked(),
+            resize_target=self.split_resize_target(),
+            resize_mode=self.resize_mode.currentText() if hasattr(self, "resize_mode") else "Keep aspect ratio",
+        )
+        self.split_worker.moveToThread(self.split_thread)
+        self.split_thread.started.connect(self.split_worker.run)
+        self.split_worker.progress.connect(self.update_progress)
+        self.split_worker.finished.connect(self.split_export_finished)
+        self.split_worker.finished.connect(self.split_thread.quit)
+        self.split_worker.finished.connect(self.split_worker.deleteLater)
+        self.split_thread.finished.connect(self.split_thread.deleteLater)
+        self.split_thread.finished.connect(self.clear_split_worker_refs)
+        self.split_thread.start()
+
+    def clear_split_worker_refs(self) -> None:
+        self.split_thread = None
+        self.split_worker = None
+
+    def split_export_finished(self, created: list[Path], log: list[str], cancelled: bool, copied: int, copy_failed: list[str], _export_dir: str) -> None:
         self.split_outputs = created
         self.split_log.setPlainText("\n".join(log))
         if hasattr(self, "split_play_button"):
@@ -3437,6 +4209,10 @@ manifest.json</pre>
             self.end_progress(f"Stopped export. Kept {len(created)} completed cut image(s)")
         else:
             self.end_progress(f"Exported {len(created)} cut image(s)")
+        if copy_failed:
+            QMessageBox.warning(self, APP_NAME, "Some final export copies failed:\n\n" + "\n".join(copy_failed[:20]))
+        if created and self.dataset_root is not None and copied:
+            self.load_current_dataset_images()
         self.cancel_requested = False
 
     def choose_dataset_root(self) -> None:
@@ -3532,6 +4308,9 @@ manifest.json</pre>
         self.status.setText("Caption saved")
 
     def generate_captions(self) -> None:
+        if self.caption_thread is not None and self.caption_thread.isRunning():
+            QMessageBox.information(self, APP_NAME, "Caption generation is already running.")
+            return
         root = self.require_dataset_root()
         if root is None:
             return
@@ -3548,43 +4327,337 @@ manifest.json</pre>
             QMessageBox.information(self, APP_NAME, f"Select images or export images to {prepped_dir} first.")
             return
         mode = self.caption_mode.currentText()
-        settings = self.settings
-        made = 0
+        settings = json.loads(json.dumps(self.settings))
         self.begin_progress("Generating captions", len(images))
-        for index, image_path in enumerate(images, start=1):
-            caption = self.make_caption(image_path, trigger, mode, settings)
-            image_path.with_suffix(CAPTION_EXT).write_text(caption, encoding="utf-8")
-            record = self.manifest.record_for(image_path.name)
+        self.cancel_requested = False
+        self.caption_thread = QThread(self)
+        self.caption_worker = CaptionWorker(self.make_caption, images, trigger, mode, settings)
+        self.caption_worker.moveToThread(self.caption_thread)
+        self.caption_thread.started.connect(self.caption_worker.run)
+        self.caption_worker.progress.connect(self.update_progress)
+        self.caption_worker.finished.connect(self.caption_generation_finished)
+        self.caption_worker.finished.connect(self.caption_thread.quit)
+        self.caption_worker.finished.connect(self.caption_worker.deleteLater)
+        self.caption_thread.finished.connect(self.caption_thread.deleteLater)
+        self.caption_thread.finished.connect(self.clear_caption_worker_refs)
+        self.caption_thread.start()
+
+    def clear_caption_worker_refs(self) -> None:
+        self.caption_thread = None
+        self.caption_worker = None
+
+    def caption_generation_finished(self, made: int, failed: list[str], records: list[tuple[str, str]], cancelled: bool, mode: str) -> None:
+        for filename, caption in records:
+            record = self.manifest.record_for(filename)
             record["caption"] = caption
-            made += 1
-            self.update_progress(index, f"Generating captions: {image_path.name}")
-        self.manifest.save(f"generated {made} caption(s) with {mode}")
-        self.end_progress(f"Generated {made} caption(s)")
+        action = f"generated {made} caption(s) with {mode}"
+        if cancelled:
+            action = f"stopped caption generation after {made} caption(s) with {mode}"
+        if failed:
+            action += f"; skipped {len(failed)} failed file(s)"
+            QMessageBox.warning(self, APP_NAME, "Some captions could not be generated:\n\n" + "\n".join(failed[:20]))
+        self.manifest.save(action)
+        self.end_progress(action)
+
+    def caption_prompt_text(self, trigger: str, settings: dict[str, Any]) -> str:
+        template = settings.get("caption_template", DEFAULT_CAPTION_TEMPLATE)
+        template = template.replace("<trigger>", trigger)
+        profile = settings.get("training_target_profile", "Unknown/custom")
+        prompt = settings.get("caption_prompt", DEFAULT_CAPTION_PROMPT)
+        return (
+            prompt.replace("<trigger>", trigger)
+            .replace("<profile>", profile)
+            .replace("<template>", template)
+        )
 
     def make_caption(self, image_path: Path, trigger: str, mode: str, settings: dict[str, Any]) -> str:
+        prompt = self.caption_prompt_text(trigger, settings)
+        if mode == "API model":
+            return self.force_trigger(self.caption_with_api_model(image_path, trigger, prompt, settings), trigger)
+        if mode == "Local server":
+            return self.force_trigger(self.caption_with_local_server(image_path, trigger, prompt, settings), trigger)
+        if mode == "Local model":
+            local_command = settings.get("local_caption_command", "").strip()
+            if local_command:
+                return self.force_trigger(self.run_caption_command(local_command, image_path, trigger, prompt, settings), trigger)
+            model_type = settings.get("local_model_type", "Local model")
+            model_path = settings.get("model_path", "")
+            if "Qwen3-VL" in model_type:
+                return self.force_trigger(self.caption_with_qwen_vl(image_path, prompt, settings), trigger)
+            raise RuntimeError(f"local model backend not configured for {model_type} at {model_path}. Use Custom command or set local_caption_command in settings.json.")
         if mode == "Custom command":
-            command = settings.get("caption_command", "").format(image=str(image_path), trigger=trigger)
-            try:
-                result = subprocess.run(command, shell=True, capture_output=True, text=True, timeout=int(settings.get("caption_timeout", 120)))
-                text = result.stdout.strip()
-                if text.startswith("{"):
-                    data = json.loads(text)
-                    text = str(data.get(settings.get("caption_json_field", "caption"), ""))
-                if text:
-                    return self.force_trigger(text, trigger)
-            except Exception as exc:
-                return f"{trigger}, caption command failed for {image_path.stem}: {exc}"
-        template = settings.get("caption_template", "<trigger>, a clear image of a <subject_type>, <framing>, <hair>, <outfit>, <setting>, <lighting>")
+            text = self.run_caption_command(settings.get("caption_command", ""), image_path, trigger, prompt, settings)
+            if text:
+                return self.force_trigger(text, trigger)
+            raise RuntimeError("caption command returned empty text")
+        template = settings.get("caption_template", DEFAULT_CAPTION_TEMPLATE)
         caption = (
             template.replace("<trigger>", trigger)
             .replace("<subject_type>", "person")
             .replace("<framing>", "centered portrait")
+            .replace("<angle>", "front view")
+            .replace("<direction>", "looking forward")
+            .replace("<expression>", "neutral expression")
             .replace("<hair>", "visible hair")
             .replace("<outfit>", "visible outfit")
             .replace("<setting>", "simple setting")
             .replace("<lighting>", "natural lighting")
         )
         return self.force_trigger(caption, trigger)
+
+    def run_caption_command(self, command_template: str, image_path: Path, trigger: str, prompt: str, settings: dict[str, Any]) -> str:
+        command = command_template.format(image=str(image_path), trigger=trigger, prompt=prompt)
+        result = subprocess.run(command, shell=True, capture_output=True, text=True, timeout=int(settings.get("caption_timeout", 120)))
+        text = result.stdout.strip()
+        if not text and result.stderr.strip():
+            raise RuntimeError(result.stderr.strip()[:500])
+        if text.startswith("{"):
+            data = json.loads(text)
+            text = str(data.get(settings.get("caption_json_field", "caption"), ""))
+        return text
+
+    def caption_with_qwen_vl(self, image_path: Path, prompt: str, settings: dict[str, Any]) -> str:
+        model_path = Path(settings.get("model_path", "")).resolve()
+        if not model_path.exists():
+            raise RuntimeError(f"local Qwen model path does not exist: {model_path}")
+        if "gguf" in model_path.name.lower():
+            raise RuntimeError("Qwen3-VL GGUF models need a llama.cpp/Ollama-style command runner. Select a Transformers-format Qwen model or use Custom command.")
+        try:
+            import torch  # type: ignore
+            from transformers import AutoModelForImageTextToText, AutoProcessor  # type: ignore
+            from qwen_vl_utils import process_vision_info  # type: ignore
+        except Exception as exc:
+            if getattr(sys, "frozen", False):
+                raise RuntimeError("Direct Transformers local models are not bundled in the clean build. Use Caption mode: Local server with Ollama, LM Studio, KoboldCPP, or a custom local endpoint.") from exc
+            raise RuntimeError("Install local caption dependencies first: python -m pip install torch transformers accelerate qwen-vl-utils") from exc
+
+        cache_key = str(model_path)
+        if cache_key not in self.local_caption_cache:
+            device_pref = settings.get("device", "Auto")
+            has_cuda = bool(getattr(torch.cuda, "is_available", lambda: False)())
+            if device_pref == "CPU":
+                device_map: str | dict[str, str] = "cpu"
+                dtype = torch.float32
+            else:
+                device_map = "auto" if device_pref == "Auto" else "cuda"
+                dtype = torch.bfloat16 if has_cuda else torch.float32
+            processor = AutoProcessor.from_pretrained(str(model_path), trust_remote_code=True)
+            model = AutoModelForImageTextToText.from_pretrained(
+                str(model_path),
+                torch_dtype=dtype,
+                device_map=device_map,
+                trust_remote_code=True,
+            )
+            self.local_caption_cache[cache_key] = {"processor": processor, "model": model}
+
+        bundle = self.local_caption_cache[cache_key]
+        processor = bundle["processor"]
+        model = bundle["model"]
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image", "image": str(image_path)},
+                    {"type": "text", "text": prompt},
+                ],
+            }
+        ]
+        text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        image_inputs, video_inputs = process_vision_info(messages)
+        inputs = processor(
+            text=[text],
+            images=image_inputs,
+            videos=video_inputs,
+            padding=True,
+            return_tensors="pt",
+        )
+        try:
+            inputs = inputs.to(model.device)
+        except Exception:
+            pass
+        output_ids = model.generate(**inputs, max_new_tokens=160)
+        input_len = inputs["input_ids"].shape[-1]
+        generated = output_ids[:, input_len:]
+        result = processor.batch_decode(generated, skip_special_tokens=True, clean_up_tokenization_spaces=False)[0].strip()
+        return result
+
+    def image_data_url(self, image_path: Path) -> tuple[str, str]:
+        suffix = image_path.suffix.lower().lstrip(".")
+        mime = "image/jpeg" if suffix in {"jpg", "jpeg"} else f"image/{suffix or 'png'}"
+        encoded = base64.b64encode(image_path.read_bytes()).decode("ascii")
+        return f"data:{mime};base64,{encoded}", encoded
+
+    def provider_api_key(self, settings: dict[str, Any], provider: str) -> str:
+        key_name = provider.lower().split()[0]
+        keys = settings.get("provider_api_keys", {})
+        return keys.get(key_name, "")
+
+    def api_error_message(self, status_code: int, body: str) -> tuple[str, bool]:
+        try:
+            data = json.loads(body)
+            error = data.get("error", data)
+            message = str(error.get("message", body)).strip()
+            code = str(error.get("code", "")).strip()
+            if code == "insufficient_quota":
+                return (
+                    "OpenAI API quota/billing is not available for this key. Check the OpenAI account billing plan, usage limits, or use a different API key in Settings.",
+                    False,
+                )
+            if code:
+                message = f"{message} ({code})"
+            return f"HTTP {status_code}: {message}", status_code in {429, 500, 502, 503, 504}
+        except Exception:
+            return f"HTTP {status_code}: {body[:700]}", status_code in {429, 500, 502, 503, 504}
+
+    def post_json(self, url: str, payload: dict[str, Any], headers: dict[str, str], timeout: int) -> dict[str, Any]:
+        data = json.dumps(payload).encode("utf-8")
+        last_error = ""
+        for attempt in range(3):
+            request = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json", **headers}, method="POST")
+            try:
+                with urllib.request.urlopen(request, timeout=timeout) as response:
+                    return json.loads(response.read().decode("utf-8", errors="replace"))
+            except urllib.error.HTTPError as exc:
+                body = exc.read().decode("utf-8", errors="replace")
+                last_error, should_retry = self.api_error_message(exc.code, body)
+                if not should_retry or attempt == 2:
+                    raise RuntimeError(last_error) from exc
+                time.sleep(1.5 * (attempt + 1))
+            except urllib.error.URLError as exc:
+                last_error = str(exc)
+                if attempt == 2:
+                    raise RuntimeError(last_error) from exc
+                time.sleep(1.5 * (attempt + 1))
+        raise RuntimeError(last_error or "request failed")
+
+    def caption_with_local_server(self, image_path: Path, trigger: str, prompt: str, settings: dict[str, Any]) -> str:
+        provider = settings.get("local_server_provider", "Ollama")
+        url = settings.get("local_server_url", "").strip()
+        model = settings.get("local_server_model", "").strip()
+        timeout = int(settings.get("caption_timeout", 120))
+        data_url, image_b64 = self.image_data_url(image_path)
+        if not url:
+            raise RuntimeError(f"missing local server URL for {provider}")
+        if provider == "Ollama":
+            if not model:
+                raise RuntimeError("missing Ollama model name")
+            if url.rstrip("/").endswith("/api/chat"):
+                payload = {
+                    "model": model,
+                    "stream": False,
+                    "messages": [{"role": "user", "content": prompt, "images": [image_b64]}],
+                }
+                data = self.post_json(url, payload, {}, timeout)
+                message = data.get("message", {})
+                return str(message.get("content", data.get("response", ""))).strip()
+            payload = {"model": model, "prompt": prompt, "images": [image_b64], "stream": False}
+            data = self.post_json(url, payload, {}, timeout)
+            return str(data.get("response", "")).strip()
+        if provider in {"LM Studio", "KoboldCPP", "Custom OpenAI-compatible"}:
+            if not model:
+                raise RuntimeError(f"missing {provider} model name")
+            payload = {
+                "model": model,
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": prompt},
+                            {"type": "image_url", "image_url": {"url": data_url}},
+                        ],
+                    }
+                ],
+                "max_tokens": 300,
+                "temperature": 0.2,
+            }
+            data = self.post_json(url, payload, {}, timeout)
+            return self.extract_chat_completion_text(data)
+        data = self.post_json(
+            url,
+            {"image": str(image_path), "image_base64": image_b64, "image_url": data_url, "trigger": trigger, "prompt": prompt, "model": model},
+            {},
+            timeout,
+        )
+        return str(data.get(settings.get("caption_json_field", "caption"), data.get("caption", data.get("text", "")))).strip()
+
+    def caption_with_api_model(self, image_path: Path, trigger: str, prompt: str, settings: dict[str, Any]) -> str:
+        provider = settings.get("api_provider", "OpenAI")
+        api_key = self.provider_api_key(settings, provider)
+        if not api_key:
+            raise RuntimeError(f"missing {provider} API key")
+        timeout = int(settings.get("caption_timeout", 120))
+        model = settings.get("api_model", "").strip()
+        data_url, image_b64 = self.image_data_url(image_path)
+        if provider == "OpenAI":
+            payload = {
+                "model": model or "gpt-4o-mini",
+                "input": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "input_text", "text": prompt},
+                            {"type": "input_image", "image_url": data_url},
+                        ],
+                    }
+                ],
+            }
+            data = self.post_json("https://api.openai.com/v1/responses", payload, {"Authorization": f"Bearer {api_key}"}, timeout)
+            return self.extract_openai_text(data)
+        if provider == "Gemini":
+            mime = data_url.split(";", 1)[0].replace("data:", "")
+            payload = {"contents": [{"parts": [{"text": prompt}, {"inline_data": {"mime_type": mime, "data": image_b64}}]}]}
+            gemini_model = model or "gemini-1.5-flash"
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/{gemini_model}:generateContent?key={api_key}"
+            data = self.post_json(url, payload, {}, timeout)
+            return data["candidates"][0]["content"]["parts"][0]["text"]
+        if provider == "Anthropic":
+            mime = data_url.split(";", 1)[0].replace("data:", "")
+            payload = {
+                "model": model or "claude-3-5-sonnet-latest",
+                "max_tokens": 300,
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "image", "source": {"type": "base64", "media_type": mime, "data": image_b64}},
+                            {"type": "text", "text": prompt},
+                        ],
+                    }
+                ],
+            }
+            data = self.post_json("https://api.anthropic.com/v1/messages", payload, {"x-api-key": api_key, "anthropic-version": "2023-06-01"}, timeout)
+            return data["content"][0]["text"]
+        custom_url = settings.get("custom_api_url", "").strip()
+        if not custom_url:
+            raise RuntimeError("missing custom_api_url in settings.json")
+        data = self.post_json(custom_url, {"image": str(image_path), "image_base64": image_b64, "trigger": trigger, "prompt": prompt}, {"Authorization": f"Bearer {api_key}"}, timeout)
+        return str(data.get(settings.get("caption_json_field", "caption"), data.get("caption", "")))
+
+    def extract_chat_completion_text(self, data: dict[str, Any]) -> str:
+        choices = data.get("choices", [])
+        if choices:
+            message = choices[0].get("message", {})
+            content = message.get("content", "")
+            if isinstance(content, list):
+                parts = []
+                for item in content:
+                    if isinstance(item, dict):
+                        parts.append(str(item.get("text", "")))
+                    else:
+                        parts.append(str(item))
+                return " ".join(part for part in parts if part).strip()
+            return str(content).strip()
+        return str(data.get("response", data.get("text", ""))).strip()
+
+    def extract_openai_text(self, data: dict[str, Any]) -> str:
+        if data.get("output_text"):
+            return str(data["output_text"])
+        chunks: list[str] = []
+        for item in data.get("output", []):
+            for content in item.get("content", []):
+                if content.get("type") in {"output_text", "text"} and content.get("text"):
+                    chunks.append(str(content["text"]))
+        return " ".join(chunks).strip()
 
     def force_trigger(self, caption: str, trigger: str) -> str:
         cleaned = caption.strip()
@@ -3598,40 +4671,88 @@ manifest.json</pre>
     def export_size_text(self) -> str:
         return self.custom_export_size.text() if self.export_size.currentText() == "Custom" else self.export_size.currentText()
 
+    def copy_images_to_prepped(self, images: list[Path], action_label: str, size_override: str | None = None) -> tuple[int, list[str], Path]:
+        root = self.require_dataset_root()
+        if root is None:
+            return 0, [], DEFAULT_DATASETS_DIR
+        trigger = self.trigger_edit.text().strip()
+        size_text = size_override or self.export_size_text()
+        export_dir = self.project_folder("export", root)
+        export_dir.mkdir(parents=True, exist_ok=True)
+        exported = 0
+        failed: list[str] = []
+        self.begin_progress(action_label, len(images))
+        for index, image_path in enumerate(images, start=1):
+            try:
+                if image_path.stat().st_size <= 0:
+                    raise ValueError("empty file")
+                out_path = unique_path(export_dir / image_path.name)
+                with Image.open(image_path) as image:
+                    out = resize_image(image.convert("RGB"), size_text, self.resize_mode.currentText())
+                    out.save(out_path)
+                cap = self.read_caption(image_path)
+                if cap:
+                    clean_caption = self.force_trigger(cap, trigger) if trigger else cap
+                    out_path.with_suffix(CAPTION_EXT).write_text(clean_caption, encoding="utf-8")
+                exported += 1
+            except Exception as exc:
+                failed.append(f"{image_path.name}: {exc}")
+            self.update_progress(index, f"{action_label}: {image_path.name}")
+        if trigger:
+            self.manifest.data["trigger"] = trigger
+        self.manifest.data["export"] = {"size": size_text, "resize_mode": self.resize_mode.currentText(), "folder": str(export_dir)}
+        self.manifest.data["dataset"]["last_exported"] = timestamp()
+        action = f"{action_label}: {exported} image(s) to {export_dir}"
+        if failed:
+            action += f"; skipped {len(failed)} failed file(s)"
+            QMessageBox.warning(self, APP_NAME, "Some files could not be exported:\n\n" + "\n".join(failed[:20]))
+        self.manifest.save(action)
+        self.end_progress(action)
+        return exported, failed, export_dir
+
+    def resize_final_export_folder(self, folder: Path) -> tuple[int, list[str]]:
+        images = image_paths_from_items([folder])
+        if not images:
+            QMessageBox.warning(self, APP_NAME, f"No images found in final export folder:\n\n{folder}")
+            return 0, []
+        trigger = self.trigger_edit.text().strip()
+        size_text = self.export_size_text()
+        exported = 0
+        failed: list[str] = []
+        self.begin_progress("Updating final export folder", len(images))
+        for index, image_path in enumerate(images, start=1):
+            try:
+                if image_path.stat().st_size <= 0:
+                    raise ValueError("empty file")
+                if size_text != "Original":
+                    with Image.open(image_path) as image:
+                        out = resize_image(image.convert("RGB"), size_text, self.resize_mode.currentText())
+                        out.save(image_path)
+                cap = self.read_caption(image_path)
+                if cap and trigger:
+                    image_path.with_suffix(CAPTION_EXT).write_text(self.force_trigger(cap, trigger), encoding="utf-8")
+                exported += 1
+            except Exception as exc:
+                failed.append(f"{image_path.name}: {exc}")
+            self.update_progress(index, f"Updating final export folder: {image_path.name}")
+        if trigger:
+            self.manifest.data["trigger"] = trigger
+        self.manifest.data["export"] = {"size": size_text, "resize_mode": self.resize_mode.currentText(), "folder": str(folder)}
+        self.manifest.data["dataset"]["last_exported"] = timestamp()
+        action = f"updated {exported} final export image(s) in {folder}"
+        if failed:
+            action += f"; skipped {len(failed)} failed file(s)"
+            QMessageBox.warning(self, APP_NAME, "Some final export files could not be updated:\n\n" + "\n".join(failed[:20]))
+        self.manifest.save(action)
+        self.end_progress(action)
+        return exported, failed
+
     def export_dataset(self) -> None:
         root = self.require_dataset_root()
         if root is None:
             return
-        trigger = self.trigger_edit.text().strip()
-        if not trigger:
-            QMessageBox.warning(self, APP_NAME, "Enter a trigger token before export.")
-            return
-        split_dir = self.project_folder("split", root)
-        images = image_paths_from_items([split_dir])
-        if not images:
-            QMessageBox.warning(self, APP_NAME, f"No split images found in {self.folder_rel('split')}.")
-            return
-        size_text = self.export_size_text()
-        base = self.project_folder("export", root)
-        export_dir = base if not any(base.iterdir()) else root / f"{base.name}_{size_text.replace('x', '')}_{timestamp()}"
-        export_dir.mkdir(parents=True, exist_ok=True)
-        exported = 0
-        self.begin_progress("Exporting final dataset", len(images))
-        for index, image_path in enumerate(images, start=1):
-            with Image.open(image_path) as image:
-                out = resize_image(image.convert("RGB"), size_text, self.resize_mode.currentText())
-                out.save(export_dir / image_path.name)
-            cap = self.read_caption(image_path)
-            if cap:
-                (export_dir / image_path.with_suffix(CAPTION_EXT).name).write_text(self.force_trigger(cap, trigger), encoding="utf-8")
-            exported += 1
-            self.update_progress(index, f"Copying split image to prepped folder: {image_path.name}")
-        self.manifest.data["trigger"] = trigger
-        self.manifest.data["export"] = {"size": size_text, "resize_mode": self.resize_mode.currentText(), "folder": str(export_dir)}
-        self.manifest.data["dataset"]["last_exported"] = timestamp()
-        self.manifest.save(f"copied {exported} split image(s) to {export_dir}")
+        self.resize_final_export_folder(self.current_prepped_folder(root))
         self.load_current_dataset_images()
-        self.end_progress(f"Copied {exported} split image(s) to {export_dir}")
 
     def validate_dataset(self) -> None:
         root = self.require_dataset_root()
@@ -3903,6 +5024,7 @@ manifest.json</pre>
         anthropic_key = QLineEdit(api_keys.get("anthropic", ""))
         custom_key = QLineEdit(api_keys.get("custom", ""))
         custom_name = QLineEdit(self.settings.get("custom_api_provider_name", "Custom HTTP"))
+        custom_url = QLineEdit(self.settings.get("custom_api_url", ""))
         for key_field in [hf_key, civitai_key, openai_key, gemini_key, anthropic_key, custom_key]:
             key_field.setEchoMode(QLineEdit.Password)
         theme_values = dict(THEME)
@@ -4122,6 +5244,7 @@ manifest.json</pre>
         layout.addRow("Gemini API key", add_help(gemini_key, "Optional key for API-model captioning. Images may be sent to the selected provider."))
         layout.addRow("Anthropic API key", add_help(anthropic_key, "Optional key for API-model captioning. Images may be sent to the selected provider."))
         layout.addRow("Custom provider name", add_help(custom_name, "Label for another provider, endpoint, or gateway."))
+        layout.addRow("Custom provider URL", add_help(custom_url, "HTTP endpoint for Custom HTTP captioning. The app POSTs image_base64, image path, trigger, and prompt as JSON."))
         layout.addRow("Custom provider key", add_help(custom_key, "Optional token for a custom HTTP caption provider or model host."))
         layout.addRow("Custom project roots", add_help(roots, "One user-added project library scan root per line."))
         layout.addRow(theme_box)
@@ -4146,6 +5269,8 @@ manifest.json</pre>
                 "custom": custom_key.text().strip(),
             }
             self.settings["custom_api_provider_name"] = custom_name.text().strip() or "Custom HTTP"
+            self.settings["custom_api_url"] = custom_url.text().strip()
+            self.settings.pop("api_key", None)
             self.settings["custom_dataset_roots"] = unique_custom_roots_from_text()
             self.settings["theme"] = current_theme_from_fields()
             self.settings["progress_gradient"] = current_progress_from_fields()

@@ -2,3 +2,7 @@ PySide6>=6.7
 Pillow>=10
 PyYAML>=6
 opencv-python>=4.9
+torch
+transformers>=4.57
+accelerate
+qwen-vl-utils
