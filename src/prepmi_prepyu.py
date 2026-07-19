@@ -77,7 +77,7 @@ except ImportError as exc:  # pragma: no cover
 
 APP_NAME = "PrepMI-PrepYU"
 APP_SUBTITLE = "Dataset Prep Studio"
-APP_VERSION = "0.1.0"
+APP_VERSION = "0.1.1"
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff"}
 CAPTION_EXT = ".txt"
 THEME = {
